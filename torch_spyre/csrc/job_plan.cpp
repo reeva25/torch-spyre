@@ -122,6 +122,9 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   auto* params = flex::createComputeParams(
       &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
   params->pipeline_barrier = pipeline_barrier_;
+  DEBUGINFO("JobPlanStepCompute::construct: submitting compute name='", name_,
+            "' bootstrap_offset=0x", std::hex, bootstrap_offset_, std::dec,
+            " bind_io=", bind_io_addresses_);
   stream.launchCompute(params);
   flex::destroyComputeParams(params);
 }

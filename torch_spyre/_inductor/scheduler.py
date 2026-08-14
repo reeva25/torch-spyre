@@ -576,6 +576,10 @@ class SuperDSCScheduling(BaseScheduling):
         if len(nodes) == 0:
             return
 
+        logger.debug(
+            "codegen_node: SpyreKernel() created for %d node(s)",
+            len(nodes),
+        )
         kernel = SpyreKernel()
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
@@ -586,6 +590,11 @@ class SuperDSCScheduling(BaseScheduling):
         kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
         kernel.kernel_name = kernel_name
         kernel.code_hash = code_hash(src_code)
+        logger.debug(
+            "codegen_node: kernel defined as '%s' with %d scheduled node(s)",
+            kernel_name,
+            len(all_schedule_nodes),
+        )
 
         with V.set_kernel_handler(kernel):
             for snode in all_schedule_nodes:
@@ -611,6 +620,11 @@ class SuperDSCScheduling(BaseScheduling):
         if len(inner_nodes) == 0:
             return
 
+        logger.debug(
+            "_codegen_counted_loop: SpyreKernel() created for %d inner node(s), loop_count=%s",
+            len(inner_nodes),
+            node.loop_count,
+        )
         kernel = SpyreKernel()
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
@@ -623,6 +637,10 @@ class SuperDSCScheduling(BaseScheduling):
         kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
         kernel.kernel_name = kernel_name
         kernel.code_hash = code_hash(src_code)
+        logger.debug(
+            "_codegen_counted_loop: kernel defined as '%s'",
+            kernel_name,
+        )
 
         with V.set_kernel_handler(kernel):
             for snode in all_schedule_nodes:
@@ -711,10 +729,20 @@ class SuperDSCScheduling(BaseScheduling):
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
+            logger.debug(
+                "define_kernel: cache hit, reusing kernel '%s'",
+                kernel_name,
+            )
         else:
             fused_name = get_fused_kernel_name(node_schedule, "original_aten")
             method = "ktir" if _spyre_config.ktir_emitter else "sdsc"
             kernel_name = "_".join([method, fused_name, wrapper.next_kernel_suffix()])
+            logger.info(
+                "define_kernel: method=%s name='%s' ops=%d",
+                method,
+                kernel_name,
+                len(node_schedule),
+            )
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()
             buf.writeline(f"async_compile.{method}('{kernel_name}',")

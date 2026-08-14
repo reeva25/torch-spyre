@@ -276,6 +276,9 @@ void SpyreStream::launch(const JobPlan& plan,
                 " must be on Spyre device, got ", args[i].device());
   }
 
+  DEBUGINFO("SpyreStream::launch: stream_id=", id(), " steps=", plan.steps.size(),
+            " tensors=", args.size());
+
   // Create launch context with tensor arguments
   LaunchContext ctx{args};
 
@@ -284,6 +287,7 @@ void SpyreStream::launch(const JobPlan& plan,
   for (const auto& step : plan.steps) {
     step->construct(ctx, *this);
   }
+  DEBUGINFO("SpyreStream::launch: all steps submitted to stream_id=", id());
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {

@@ -211,9 +211,11 @@ static int64_t safe_stoll(const std::string& str,
 }
 
 JobPlanBuilder::JobPlanBuilder(const std::string& spyrecode_dir,
-                               const SpyreStream* stream)
+                               const SpyreStream* stream,
+                               std::optional<std::string> profiler_name)
     : spyrecode_dir_(spyrecode_dir),
-      stream_(stream ? *stream : getCurrentStream()) {
+      stream_(stream ? *stream : getCurrentStream()),
+      profiler_name_(std::move(profiler_name)) {
   // Validate directory exists
   TORCH_CHECK(std::filesystem::exists(spyrecode_dir_),
               "SpyreCode directory does not exist: ", spyrecode_dir_.string());
@@ -270,6 +272,7 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
   job_allocation_.emplace_back(
       std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
                     ->composite_addr));
+  DEBUGINFO("executeAllocate: size=", size, " bytes, dir=", spyrecode_dir_.string());
 }
 
 void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
@@ -310,6 +313,8 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   stream_.copyProgramAsync(
       const_cast<void*>(static_cast<const void*>(inits_.back().data())),
       &job_allocation_.back());
+  DEBUGINFO("executeInitTransfer: binary=", binary_file, " size=", init_size,
+            " bytes, dev_ptr=0x", std::hex, dev_ptr, std::dec);
 }
 
 void JobPlanBuilder::executeJobPreparationPlan() {
@@ -318,6 +323,9 @@ void JobPlanBuilder::executeJobPreparationPlan() {
               "JobPreparationPlan must be an array with at least 2 commands (1 "
               "Allocate and 1+ InitTransfer)");
 
+  DEBUGINFO("executeJobPreparationPlan: ", job_prep_plan.size(),
+            " command(s) (1 Allocate + ", job_prep_plan.size() - 1,
+            " InitTransfer(s))");
   job_allocation_.reserve(job_prep_plan.size());
   inits_.reserve(job_prep_plan.size() - 1);
 
@@ -347,7 +355,15 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // in the trace without dragging the full /tmp/torchinductor_*/... prefix.
   // The step index disambiguates multi-compute plans.
   std::string name;
-  if (cmd.contains("name") && cmd["name"].is_string()) {
+  // A compiler provenance name deliberately overrides any backend-emitted
+  // label: every compute step needs the same stable bundle join key. Without a
+  // provenance name, preserve the existing backend and directory fallbacks.
+  if (profiler_name_.has_value() && !profiler_name_->empty()) {
+    name = *profiler_name_ + "#" + std::to_string(step_idx);
+    TORCH_CHECK(name.size() <= kAIUptiActivityNameMaxBytes,
+                "profiler-visible compute name exceeds AIUPTI limit: ",
+                name.size(), " bytes > ", kAIUptiActivityNameMaxBytes);
+  } else if (cmd.contains("name") && cmd["name"].is_string()) {
     name = cmd["name"].get<std::string>();
   } else {
     auto inner = spyrecode_dir_.filename();  // spyreCodeDir
@@ -381,6 +397,8 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
       "ComputeOnDevice program allocation must be populated (size > 0)");
   flex::CompositeAddress program_address(job_allocation_.at(0).chunks()[0]);
 
+  DEBUGINFO("translateComputeOnDevice[", step_idx, "]: name=", name,
+            " bootstrap_offset=0x", std::hex, bootstrap_offset, std::dec);
   return std::make_unique<JobPlanStepCompute>(
       std::move(program_address), bind_io_addresses_, bootstrap_offset,
       std::move(name));
@@ -597,6 +615,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateCommand(
 std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   auto job_exec_plan = spyrecode_json_["JobExecPlan"];
   TORCH_CHECK(job_exec_plan.is_array(), "JobExecPlan must be an array");
+  DEBUGINFO("translateJobExecPlan: ", job_exec_plan.size(), " command(s) to translate");
 
   // TODO(jni): further discussions is required on the condition to specialize
   // addresses
@@ -623,6 +642,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
     pinned_buffers.push_back(std::move(tensor));
   }
 
+  DEBUGINFO("translateJobExecPlan: translated ", steps.size(), " step(s), ",
+            pinned_buffers.size(), " pinned buffer(s)");
   // Create and return the JobPlan
   // Use brace initialization to construct JobPlan with moved members
   return std::make_unique<JobPlan>(
@@ -736,12 +757,15 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
   return job_plan;
 }
 
-std::unique_ptr<JobPlan> prepareKernel(const std::string& spyrecode_dir,
-                                       const SpyreStream* stream) {
-  JobPlanBuilder builder(spyrecode_dir, stream);
+std::unique_ptr<JobPlan> prepareKernel(
+    const std::string& spyrecode_dir, const SpyreStream* stream,
+    std::optional<std::string> profiler_name) {
+  DEBUGINFO("prepareKernel: spyrecode_dir=", spyrecode_dir);
+  JobPlanBuilder builder(spyrecode_dir, stream, std::move(profiler_name));
   auto jobplan = builder.build();
 
-  // Dump JobPlan if debug logging is enabled
+  DEBUGINFO("prepareKernel: complete, steps=", jobplan->steps.size());
+  // Dump full JobPlan if debug logging is enabled
   DEBUGINFO("JobPlan:\n", *jobplan);
 
   return jobplan;
