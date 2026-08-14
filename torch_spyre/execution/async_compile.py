@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import tempfile
-from typing import Any, cast
 from collections.abc import Sequence
 import os
 import subprocess
@@ -28,9 +27,6 @@ from torch_spyre._inductor.op_spec import (
     OpSpec,
     UnimplementedOp,
     find_unimplemented,
-)
-from torch_spyre._inductor.kernel_provenance import (
-    build_kernel_provenance_descriptor,
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
@@ -58,11 +54,6 @@ class SpyreAsyncCompile(AsyncCompile):
     CPU kernel it was never given.
 
     """
-
-    def __init__(self):
-        super().__init__()
-        self._provenance_attempt_count = 0
-        self._provenance_failure_count = 0
 
     def triton(self, *args, **kwargs):
         raise NotImplementedError(
@@ -92,29 +83,6 @@ class SpyreAsyncCompile(AsyncCompile):
         generate_bundle(kernel_name, output_dir, specs)
         logger.debug("sdsc: generate_bundle complete for '%s'", kernel_name)
 
-        self._provenance_attempt_count += 1
-        try:
-            # This is the common fresh-compile/cache-reload boundary: generated
-            # wrappers have reconstructed the finalized OpSpecs before calling
-            # sdsc(). Derive the transport-neutral identity here without changing
-            # the generated wrapper call ABI.
-            finalized_specs = cast(Sequence[OpSpec | LoopSpec], specs)
-            kernel_provenance = build_kernel_provenance_descriptor(finalized_specs)
-        except Exception:  # noqa: BLE001 - provenance must never fail the build
-            # Keep canonicalization strict rather than issuing an ambiguous
-            # fallback key. Log the first traceback, then report the complete
-            # failure count at the generated wrapper's wait() boundary.
-            self._provenance_failure_count += 1
-            if self._provenance_failure_count == 1:
-                logger.warning(
-                    "kernel provenance descriptor construction failed for kernel "
-                    "%s; continuing without kernel provenance; additional "
-                    "failures in this compilation will be summarized",
-                    kernel_name,
-                    exc_info=True,
-                )
-            kernel_provenance = None
-
         # Invoke backend compiler of SDSC Bundle
         logger.info("sdsc: invoking dxp_standalone for '%s'", kernel_name)
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
@@ -131,11 +99,7 @@ class SpyreAsyncCompile(AsyncCompile):
                 raise
 
         logger.info("sdsc: dxp_standalone complete for '%s'", kernel_name)
-        return SpyreSDSCKernelRunner(
-            kernel_name,
-            output_dir,
-            kernel_provenance=kernel_provenance,
-        )
+        return SpyreSDSCKernelRunner(kernel_name, output_dir)
 
     def ktir(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
@@ -172,14 +136,3 @@ class SpyreAsyncCompile(AsyncCompile):
             f"was written to {ktir_path} for inspection. Execution lands in a "
             "later PR."
         )
-
-    def wait(self, scope: dict[str, Any]) -> None:
-        super().wait(scope)
-        if self._provenance_failure_count:
-            logger.warning(
-                "kernel provenance disabled for %d/%d compiled Spyre kernels",
-                self._provenance_failure_count,
-                self._provenance_attempt_count,
-            )
-        self._provenance_attempt_count = 0
-        self._provenance_failure_count = 0

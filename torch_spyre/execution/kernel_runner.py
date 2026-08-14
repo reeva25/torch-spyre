@@ -13,16 +13,8 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import (
-    launch_jobplan,
-    prepare_kernel,
-    register_kernel_provenance,
-)
+from torch_spyre._C import launch_jobplan, prepare_kernel
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.kernel_provenance import KernelProvenanceDescriptor
-from torch_spyre._inductor.profiler_event import (
-    format_kernel_provenance_event_name,
-)
 from torch_spyre.profiler._ffdc import (
     CATEGORY_RUNTIME_LAUNCH,
     CATEGORY_UNIMPLEMENTED,
@@ -46,47 +38,13 @@ class SpyreUnimplementedRunner:
 
 
 class SpyreSDSCKernelRunner:
-    def __init__(
-        self,
-        name: str,
-        code_dir: str,
-        kernel_provenance: KernelProvenanceDescriptor | None = None,
-    ):
+    def __init__(self, name: str, code_dir: str):
         self.kernel_name = name
         self.code_dir = code_dir
-        self.kernel_provenance = kernel_provenance
-        self.profiler_event_name: str | None
         spyrecode_dir = code_dir + "/spyreCodeDir"
-        if kernel_provenance is None:
-            self.profiler_event_name = None
-            logger.info("PREPARE: '%s' spyrecode_dir=%s", name, spyrecode_dir)
-            self.jobplan = prepare_kernel(spyrecode_dir)
-        else:
-            self.profiler_event_name = format_kernel_provenance_event_name(
-                kernel_provenance
-            )
-            # Rejection is intentionally fail-open: C++ warns and counts
-            # conflicts while the key-bearing name remains the compatibility
-            # join.
-            register_kernel_provenance(
-                self.profiler_event_name,
-                list(kernel_provenance.debug_handle_ids),
-            )
-            logger.info(
-                "PREPARE: '%s' spyrecode_dir=%s profiler_name=%s",
-                name,
-                spyrecode_dir,
-                self.profiler_event_name,
-            )
-            self.jobplan = prepare_kernel(
-                spyrecode_dir,
-                profiler_name=self.profiler_event_name,
-            )
-        logger.info(
-            "READY: '%s' steps=%d",
-            name,
-            self.jobplan.num_steps(),
-        )
+        logger.info("PREPARE: '%s' spyrecode_dir=%s", name, spyrecode_dir)
+        self.jobplan = prepare_kernel(spyrecode_dir)
+        logger.info("READY: '%s' steps=%d", name, self.jobplan.num_steps())
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
     def run(self, *args, **kw_args):

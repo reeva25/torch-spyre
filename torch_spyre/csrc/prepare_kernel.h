@@ -45,11 +45,8 @@ class JobPlanBuilder {
    * @param spyrecode_dir Path to the SpyreCode directory
    * @param stream Optional stream to use for init transfers. If nullptr, uses
    * the current stream from getCurrentStream()
-   * @param profiler_name Optional stable base name for profiler-visible compute
-   * events (passed down to translateComputeOnDevice for step labelling).
    */
-  JobPlanBuilder(const std::string& spyrecode_dir, const SpyreStream* stream,
-                 std::optional<std::string> profiler_name = std::nullopt);
+  JobPlanBuilder(const std::string& spyrecode_dir, const SpyreStream* stream);
 
   /**
    * @brief Build the JobPlan
@@ -139,8 +136,6 @@ class JobPlanBuilder {
   nlohmann::json spyrecode_json_;
   /// Stream used for initialization transfers during preparation
   const SpyreStream stream_;
-  /// Optional stable base name for profiler-visible compute events
-  std::optional<std::string> profiler_name_;
   /// Device memory allocation for the job (set during preparation and moved to
   /// JobPlan in translation)
   std::vector<flex::CompositeAddress> job_allocation_;
@@ -185,8 +180,7 @@ class JobPlanBuilder {
  * current stream from getCurrentStream()
  * @return Prepared JobPlan
  */
-std::unique_ptr<JobPlan> prepareKernel(
-    const std::string& spyrecode_dir, const SpyreStream* stream = nullptr,
-    std::optional<std::string> profiler_name = std::nullopt);
+std::unique_ptr<JobPlan> prepareKernel(const std::string& spyrecode_dir,
+                                       const SpyreStream* stream = nullptr);
 
 }  // namespace spyre

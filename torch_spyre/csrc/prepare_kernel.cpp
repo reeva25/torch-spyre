@@ -211,11 +211,9 @@ static int64_t safe_stoll(const std::string& str,
 }
 
 JobPlanBuilder::JobPlanBuilder(const std::string& spyrecode_dir,
-                               const SpyreStream* stream,
-                               std::optional<std::string> profiler_name)
+                               const SpyreStream* stream)
     : spyrecode_dir_(spyrecode_dir),
-      stream_(stream ? *stream : getCurrentStream()),
-      profiler_name_(std::move(profiler_name)) {
+      stream_(stream ? *stream : getCurrentStream()) {
   // Validate directory exists
   TORCH_CHECK(std::filesystem::exists(spyrecode_dir_),
               "SpyreCode directory does not exist: ", spyrecode_dir_.string());
@@ -355,15 +353,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // in the trace without dragging the full /tmp/torchinductor_*/... prefix.
   // The step index disambiguates multi-compute plans.
   std::string name;
-  // A compiler provenance name deliberately overrides any backend-emitted
-  // label: every compute step needs the same stable bundle join key. Without a
-  // provenance name, preserve the existing backend and directory fallbacks.
-  if (profiler_name_.has_value() && !profiler_name_->empty()) {
-    name = *profiler_name_ + "#" + std::to_string(step_idx);
-    TORCH_CHECK(name.size() <= kAIUptiActivityNameMaxBytes,
-                "profiler-visible compute name exceeds AIUPTI limit: ",
-                name.size(), " bytes > ", kAIUptiActivityNameMaxBytes);
-  } else if (cmd.contains("name") && cmd["name"].is_string()) {
+  if (cmd.contains("name") && cmd["name"].is_string()) {
     name = cmd["name"].get<std::string>();
   } else {
     auto inner = spyrecode_dir_.filename();  // spyreCodeDir
@@ -758,10 +748,9 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
 }
 
 std::unique_ptr<JobPlan> prepareKernel(
-    const std::string& spyrecode_dir, const SpyreStream* stream,
-    std::optional<std::string> profiler_name) {
+    const std::string& spyrecode_dir, const SpyreStream* stream) {
   DEBUGINFO("prepareKernel: spyrecode_dir=", spyrecode_dir);
-  JobPlanBuilder builder(spyrecode_dir, stream, std::move(profiler_name));
+  JobPlanBuilder builder(spyrecode_dir, stream);
   auto jobplan = builder.build();
 
   DEBUGINFO("prepareKernel: complete, steps=", jobplan->steps.size());
