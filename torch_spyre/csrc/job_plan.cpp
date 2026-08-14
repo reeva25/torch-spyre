@@ -22,6 +22,7 @@
 #include <variant>
 #include <vector>
 
+#include "logging.h"
 #include "spyre_allocator.h"
 #include "spyre_stream.h"
 #include "spyrecode-host-functions/processSpyreCodeArtifacts.h"
