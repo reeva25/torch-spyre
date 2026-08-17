@@ -738,10 +738,11 @@ class SuperDSCScheduling(BaseScheduling):
             method = "ktir" if _spyre_config.ktir_emitter else "sdsc"
             kernel_name = "_".join([method, fused_name, wrapper.next_kernel_suffix()])
             logger.info(
-                "define_kernel: method=%s name='%s' ops=%d",
+                "STEP 1 define_kernel: method=%s name='%s' ops=%d; writing async_compile.%s(...) into generated wrapper",
                 method,
                 kernel_name,
                 len(node_schedule),
+                method,
             )
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()

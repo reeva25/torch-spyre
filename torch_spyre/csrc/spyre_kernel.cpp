@@ -40,12 +40,16 @@ namespace spyre {
 
 void launchJobPlan(const JobPlan& job_plan, const std::vector<at::Tensor>& args,
                    const SpyreStream& stream) {
+  DEBUGINFO("STEP 11 launchJobPlan(stream overload): launching on stream_id=",
+            stream.id(), " with ", args.size(), " arg(s)");
   stream.launch(job_plan, args);
 }
 
 void launchJobPlan(const JobPlan& job_plan,
                    const std::vector<at::Tensor>& args) {
   auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+  DEBUGINFO("STEP 11 launchJobPlan(no-stream overload): resolved current stream_id=",
+            stream.id(), " for ", args.size(), " arg(s)");
   launchJobPlan(job_plan, args, stream);
 }
 

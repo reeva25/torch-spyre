@@ -42,15 +42,27 @@ class SpyreSDSCKernelRunner:
         self.kernel_name = name
         self.code_dir = code_dir
         spyrecode_dir = code_dir + "/spyreCodeDir"
-        logger.info("PREPARE: '%s' spyrecode_dir=%s", name, spyrecode_dir)
+        logger.info(
+            "STEP 5 SpyreSDSCKernelRunner.__init__: calling prepare_kernel for '%s' with spyrecode_dir=%s",
+            name,
+            spyrecode_dir,
+        )
         self.jobplan = prepare_kernel(spyrecode_dir)
-        logger.info("READY: '%s' steps=%d", name, self.jobplan.num_steps())
+        logger.info(
+            "STEP 5 SpyreSDSCKernelRunner.__init__: prepare_kernel complete for '%s'; steps=%d",
+            name,
+            self.jobplan.num_steps(),
+        )
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
     def run(self, *args, **kw_args):
-        logger.info("RUN: '%s' tensors=%d", self.kernel_name, len(args))
+        logger.info(
+            "STEP 9/10 SpyreSDSCKernelRunner.run: launching '%s' with %d live tensor args",
+            self.kernel_name,
+            len(args),
+        )
         logger.debug(
-            "RUN: '%s' shapes=%s dtypes=%s",
+            "STEP 9/10 SpyreSDSCKernelRunner.run: '%s' shapes=%s dtypes=%s",
             self.kernel_name,
             [list(a.shape) for a in args],
             [str(a.dtype) for a in args],

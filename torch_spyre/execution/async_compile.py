@@ -79,12 +79,16 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Generate SDSC Bundle from OpSpecs
         output_dir = get_output_dir(kernel_name)
-        logger.debug("sdsc: generate_bundle starting for '%s', output_dir=%s", kernel_name, output_dir)
+        logger.info(
+            "STEP 2 sdsc: generating SDSC bundle for '%s' in %s",
+            kernel_name,
+            output_dir,
+        )
         generate_bundle(kernel_name, output_dir, specs)
-        logger.debug("sdsc: generate_bundle complete for '%s'", kernel_name)
+        logger.info("STEP 2 sdsc: bundle generation complete for '%s'", kernel_name)
 
         # Invoke backend compiler of SDSC Bundle
-        logger.info("sdsc: invoking dxp_standalone for '%s'", kernel_name)
+        logger.info("STEP 2 sdsc: invoking dxp_standalone for '%s'", kernel_name)
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
             try:
                 subprocess.run(["dxp_standalone", "-d", output_dir], check=True)
@@ -98,7 +102,12 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
                 raise
 
-        logger.info("sdsc: dxp_standalone complete for '%s'", kernel_name)
+        logger.info("STEP 2 sdsc: dxp_standalone complete for '%s'", kernel_name)
+        logger.info(
+            "STEP 4 sdsc: returning SpyreSDSCKernelRunner('%s', '%s')",
+            kernel_name,
+            output_dir,
+        )
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
 
     def ktir(

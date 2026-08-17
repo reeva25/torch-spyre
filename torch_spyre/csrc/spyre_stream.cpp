@@ -244,21 +244,31 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
   RECORD_FUNCTION("launch::H2D", {});
+  DEBUGINFO("STEP 14 SpyreStream::launchH2D: resolving runtime handle for stream_id=",
+            id());
   resolveRuntimeHandle()->launchOperationH2D(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
   RECORD_FUNCTION("launch::D2H", {});
+  DEBUGINFO("STEP 14 SpyreStream::launchD2H: resolving runtime handle for stream_id=",
+            id());
   resolveRuntimeHandle()->launchOperationD2H(params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
   RECORD_FUNCTION("launch::Compute", {});
+  DEBUGINFO(
+      "STEP 14 SpyreStream::launchCompute: resolving runtime handle for stream_id=",
+      id());
   resolveRuntimeHandle()->launchOperationCompute(params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   RECORD_FUNCTION("launch::HostCallback", {});
+  DEBUGINFO(
+      "STEP 14 SpyreStream::launchHostCallback: resolving runtime handle for stream_id=",
+      id());
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
@@ -276,18 +286,21 @@ void SpyreStream::launch(const JobPlan& plan,
                 " must be on Spyre device, got ", args[i].device());
   }
 
-  DEBUGINFO("SpyreStream::launch: stream_id=", id(), " steps=", plan.steps.size(),
-            " tensors=", args.size());
+  DEBUGINFO("STEP 12 SpyreStream::launch: stream_id=", id(), " steps=",
+            plan.steps.size(), " tensors=", args.size());
 
   // Create launch context with tensor arguments
   LaunchContext ctx{args};
 
   // Each JobPlanStep builds its flex operation params and launches them on
   // this stream in order. flex owns the RuntimeOperation lifecycle.
-  for (const auto& step : plan.steps) {
-    step->construct(ctx, *this);
+  for (size_t i = 0; i < plan.steps.size(); ++i) {
+    DEBUGINFO("STEP 12 SpyreStream::launch: constructing step ", i, " of ",
+              plan.steps.size());
+    plan.steps[i]->construct(ctx, *this);
   }
-  DEBUGINFO("SpyreStream::launch: all steps submitted to stream_id=", id());
+  DEBUGINFO("STEP 12 SpyreStream::launch: all steps submitted to stream_id=",
+            id());
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
