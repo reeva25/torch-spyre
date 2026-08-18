@@ -743,6 +743,7 @@ class SuperDSCScheduling(BaseScheduling):
             print(
                 "STEP 1 define_kernel: generated wrapper line:",
                 first_line,
+                flush=True,
             )
             buf.writeline(first_line)
             with buf.indent():

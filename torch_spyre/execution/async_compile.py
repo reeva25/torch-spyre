@@ -79,12 +79,18 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Generate SDSC Bundle from OpSpecs
         output_dir = get_output_dir(kernel_name)
-        print(f"STEP 2 sdsc: generating SDSC bundle for '{kernel_name}' in {output_dir}")
+        print(
+            f"STEP 2 sdsc: generating SDSC bundle for '{kernel_name}' in {output_dir}",
+            flush=True,
+        )
         generate_bundle(kernel_name, output_dir, specs)
-        print(f"STEP 2 sdsc: bundle generation complete for '{kernel_name}'")
+        print(
+            f"STEP 2 sdsc: bundle generation complete for '{kernel_name}'",
+            flush=True,
+        )
 
         # Invoke backend compiler of SDSC Bundle
-        print(f"STEP 2 sdsc: invoking dxp_standalone for '{kernel_name}'")
+        print(f"STEP 2 sdsc: invoking dxp_standalone for '{kernel_name}'", flush=True)
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
             try:
                 subprocess.run(["dxp_standalone", "-d", output_dir], check=True)
@@ -98,9 +104,10 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
                 raise
 
-        print(f"STEP 2 sdsc: dxp_standalone complete for '{kernel_name}'")
+        print(f"STEP 2 sdsc: dxp_standalone complete for '{kernel_name}'", flush=True)
         print(
-            f"STEP 4 sdsc: returning SpyreSDSCKernelRunner('{kernel_name}', '{output_dir}')"
+            f"STEP 4 sdsc: returning SpyreSDSCKernelRunner('{kernel_name}', '{output_dir}')",
+            flush=True,
         )
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
 
