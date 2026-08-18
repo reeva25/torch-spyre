@@ -243,11 +243,12 @@ JobPlanBuilder::JobPlanBuilder(const std::string& spyrecode_dir,
   TORCH_CHECK(spyrecode_json_.contains("JobExecPlan"),
               "SpyreCode JSON missing 'JobExecPlan' array");
 
-  DEBUGINFO("STEP 3 JobPlanBuilder::JobPlanBuilder: loaded spyrecode.json from ",
-            spyrecode_json_path.string(), " with JobPreparationPlan=",
-            spyrecode_json_["JobPreparationPlan"].size(),
-            " command(s), JobExecPlan=",
-            spyrecode_json_["JobExecPlan"].size(), " command(s)");
+  std::cout
+      << "STEP 3 JobPlanBuilder::JobPlanBuilder: loaded spyrecode.json from "
+      << spyrecode_json_path.string() << " with JobPreparationPlan="
+      << spyrecode_json_["JobPreparationPlan"].size()
+      << " command(s), JobExecPlan="
+      << spyrecode_json_["JobExecPlan"].size() << " command(s)" << std::endl;
 }
 
 void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
@@ -317,9 +318,9 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   stream_.copyProgramAsync(
       const_cast<void*>(static_cast<const void*>(inits_.back().data())),
       &job_allocation_.back());
-  DEBUGINFO("STEP 7 executeInitTransfer: loaded binary=", binary_file,
-            " size=", init_size, " bytes into dev_ptr=0x", std::hex,
-            dev_ptr, std::dec);
+  std::cout << "STEP 7 executeInitTransfer: loaded binary=" << binary_file
+            << " size=" << init_size << " bytes into dev_ptr=0x" << std::hex
+            << dev_ptr << std::dec << std::endl;
 }
 
 void JobPlanBuilder::executeJobPreparationPlan() {
@@ -328,20 +329,22 @@ void JobPlanBuilder::executeJobPreparationPlan() {
               "JobPreparationPlan must be an array with at least 2 commands (1 "
               "Allocate and 1+ InitTransfer)");
 
-  DEBUGINFO("STEP 7 executeJobPreparationPlan: ", job_prep_plan.size(),
-            " command(s) (1 Allocate + ", job_prep_plan.size() - 1,
-            " InitTransfer(s))");
+  std::cout << "STEP 7 executeJobPreparationPlan: " << job_prep_plan.size()
+            << " command(s) (1 Allocate + " << job_prep_plan.size() - 1
+            << " InitTransfer(s))" << std::endl;
   job_allocation_.reserve(job_prep_plan.size());
   inits_.reserve(job_prep_plan.size() - 1);
 
   // Execute Allocate command (first item)
-  DEBUGINFO("STEP 7 executeJobPreparationPlan: executing Allocate command");
+  std::cout << "STEP 7 executeJobPreparationPlan: executing Allocate command"
+            << std::endl;
   executeAllocate(job_prep_plan[0]);
 
   // Execute InitTransfer commands (remaining items)
   for (size_t i = 1; i < job_prep_plan.size(); ++i) {
-    DEBUGINFO("STEP 7 executeJobPreparationPlan: executing InitTransfer command ",
-              i, " of ", job_prep_plan.size() - 1);
+    std::cout
+        << "STEP 7 executeJobPreparationPlan: executing InitTransfer command "
+        << i << " of " << job_prep_plan.size() - 1 << std::endl;
     executeInitTransfer(job_prep_plan[i]);
   }
 }
@@ -615,8 +618,8 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateCommand(
 std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   auto job_exec_plan = spyrecode_json_["JobExecPlan"];
   TORCH_CHECK(job_exec_plan.is_array(), "JobExecPlan must be an array");
-  DEBUGINFO("STEP 8 translateJobExecPlan: ", job_exec_plan.size(),
-            " command(s) to translate");
+  std::cout << "STEP 8 translateJobExecPlan: " << job_exec_plan.size()
+            << " command(s) to translate" << std::endl;
 
   // TODO(jni): further discussions is required on the condition to specialize
   // addresses
@@ -627,8 +630,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   std::vector<std::unique_ptr<JobPlanStep>> steps;
   for (size_t i = 0; i < job_exec_plan.size(); ++i) {
     try {
-      DEBUGINFO("STEP 8 translateJobExecPlan: translating command ", i,
-                " of ", job_exec_plan.size());
+      std::cout << "STEP 8 translateJobExecPlan: translating command " << i
+                << " of " << job_exec_plan.size() << std::endl;
       steps.push_back(translateCommand(job_exec_plan[i], i));
     }
     catch (const std::exception& e) {
@@ -645,8 +648,9 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
     pinned_buffers.push_back(std::move(tensor));
   }
 
-  DEBUGINFO("STEP 8 translateJobExecPlan: translated ", steps.size(),
-            " step(s), ", pinned_buffers.size(), " pinned buffer(s)");
+  std::cout << "STEP 8 translateJobExecPlan: translated " << steps.size()
+            << " step(s), " << pinned_buffers.size() << " pinned buffer(s)"
+            << std::endl;
   // Create and return the JobPlan
   // Use brace initialization to construct JobPlan with moved members
   return std::make_unique<JobPlan>(
@@ -736,7 +740,7 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
 }
 
 std::unique_ptr<JobPlan> JobPlanBuilder::build() {
-  DEBUGINFO("STEP 6 JobPlanBuilder::build: starting build()");
+  std::cout << "STEP 6 JobPlanBuilder::build: starting build()" << std::endl;
 
   // Execute job preparation plan (allocate + init transfers)
   executeJobPreparationPlan();
@@ -745,8 +749,8 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
   auto job_plan = translateJobExecPlan();
 
   // Validate the JobPlan before returning
-  DEBUGINFO("STEP 9 JobPlanBuilder::build: validating JobPlan with ",
-            job_plan->steps.size(), " step(s)");
+  std::cout << "STEP 9 JobPlanBuilder::build: validating JobPlan with "
+            << job_plan->steps.size() << " step(s)" << std::endl;
   auto validation_result = validate(*job_plan);
   if (!validation_result.isValid()) {
     std::string error_msg = "JobPlan validation failed:\n";
@@ -758,21 +762,24 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
         error_msg += "  WARNING: " + msg.message + "\n";
       }
     }
-    DEBUGINFO("STEP 9 JobPlanBuilder::build: validation failed");
+    std::cout << "STEP 9 JobPlanBuilder::build: validation failed"
+              << std::endl;
     TORCH_CHECK(false, error_msg);
   }
 
-  DEBUGINFO("STEP 9 JobPlanBuilder::build: validation passed");
+  std::cout << "STEP 9 JobPlanBuilder::build: validation passed" << std::endl;
   return job_plan;
 }
 
 std::unique_ptr<JobPlan> prepareKernel(
     const std::string& spyrecode_dir, const SpyreStream* stream) {
-  DEBUGINFO("STEP 6 prepareKernel: spyrecode_dir=", spyrecode_dir);
+  std::cout << "STEP 6 prepareKernel: spyrecode_dir=" << spyrecode_dir
+            << std::endl;
   JobPlanBuilder builder(spyrecode_dir, stream);
   auto jobplan = builder.build();
 
-  DEBUGINFO("STEP 6 prepareKernel: complete, steps=", jobplan->steps.size());
+  std::cout << "STEP 6 prepareKernel: complete, steps=" << jobplan->steps.size()
+            << std::endl;
   // Dump full JobPlan if debug logging is enabled
   DEBUGINFO("JobPlan:\n", *jobplan);
 
