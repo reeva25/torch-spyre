@@ -197,6 +197,11 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   std::cout << "  * Output Patch Buffer : " << output_buffer_
             << " (" << output_buffer_size_ << " bytes in Pinned Host RAM)\n";
 
+  if (hcm_) {
+    std::cout << "\n  * [HCM RECIPE] Compiler Metadata (JSON):\n";
+    std::cout << hcm_->exportJsonStr("    ") << "\n";
+  }
+
   // Helper lambda to build HostCallbackParams and launch on the stream.
   // flex::RuntimeStream::launchOperationHostCallback() invokes the callback
   // synchronously in the calling thread, so exceptions propagate directly
