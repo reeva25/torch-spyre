@@ -37,9 +37,9 @@ void JobPlanStepH2D::construct(LaunchContext&,
       flex::createDmaParams(host_address_, device_address_.total_size(),
                             /*to_device=*/true, &device_address_);
   params->pipeline_barrier = pipeline_barrier_;
-  // std::cout << "STEP 13 JobPlanStepH2D::construct: size="
-  //           << device_address_.total_size()
-  //           << " pipeline_barrier=" << pipeline_barrier_ << std::endl;
+  std::cout << "STEP 13 JobPlanStepH2D::construct: size="
+            << device_address_.total_size()
+            << " pipeline_barrier=" << pipeline_barrier_ << std::endl;
   stream.launchH2D(params);
   flex::destroyDmaParams(params);
 }
@@ -61,9 +61,9 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address.total_size(),
                               /*to_device=*/false, &device_address);
     params->pipeline_barrier = pipeline_barrier_;
-    // std::cout << "STEP 13 JobPlanStepD2H::construct: composite-address size="
-    //           << device_address.total_size() << " pipeline_barrier="
-    //           << pipeline_barrier_ << std::endl;
+    std::cout << "STEP 13 JobPlanStepD2H::construct: composite-address size="
+              << device_address.total_size() << " pipeline_barrier="
+              << pipeline_barrier_ << std::endl;
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   } else {
@@ -98,9 +98,9 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
     params->callback = [device_address](void*) {};
-    // std::cout << "STEP 13 JobPlanStepD2H::construct: tensor-segment size="
-    //           << device_address->total_size() << " pipeline_barrier="
-    //           << pipeline_barrier_ << std::endl;
+    std::cout << "STEP 13 JobPlanStepD2H::construct: tensor-segment size="
+              << device_address->total_size() << " pipeline_barrier="
+              << pipeline_barrier_ << std::endl;
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -134,11 +134,11 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   auto* params = flex::createComputeParams(
       &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
   params->pipeline_barrier = pipeline_barrier_;
-  // std::cout << "STEP 13 JobPlanStepCompute::construct: submitting compute name='"
-  //           << name_ << "' bootstrap_offset=0x" << std::hex
-  //           << bootstrap_offset_ << std::dec << " bind_io="
-  //           << bind_io_addresses_ << " pipeline_barrier=" << pipeline_barrier_
-  //           << std::endl;
+  std::cout << "STEP 13 JobPlanStepCompute::construct: submitting compute name='"
+            << name_ << "' bootstrap_offset=0x" << std::hex
+            << bootstrap_offset_ << std::dec << " bind_io="
+            << bind_io_addresses_ << " pipeline_barrier=" << pipeline_barrier_
+            << std::endl;
   stream.launchCompute(params);
   flex::destroyComputeParams(params);
 }
@@ -212,6 +212,9 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
         flex::destroyHostCallbackParams(p);
       }
     } guard{params};
+    std::cout
+        << "STEP 13 JobPlanStepHostCompute::construct: launching host callback"
+        << " pipeline_barrier=" << pipeline_barrier_ << std::endl;
     stream.launchHostCallback(params);
   };
 

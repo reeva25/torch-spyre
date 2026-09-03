@@ -1,0 +1,314 @@
+
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    background: #ffffff;
+    color: #1f2328;
+    padding: 40px 32px;
+    max-width: 860px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 6px;
+    color: #1f2328;
+  }
+  .subtitle {
+    font-size: 13px;
+    color: #57606a;
+    margin-bottom: 36px;
+  }
+
+  /* ── lane container ── */
+  .flow {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  /* ── each step row ── */
+  .step {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+  }
+
+  /* ── left label ── */
+  .lane-label {
+    width: 148px;
+    min-width: 148px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    padding: 14px 12px 14px 0;
+    border-right: 2px solid #e5e7eb;
+    margin-right: 20px;
+  }
+  .lane-label .file {
+    font-size: 11px;
+    font-weight: 700;
+    color: #3b82d4;
+    letter-spacing: 0.02em;
+    margin-bottom: 2px;
+  }
+  .lane-label .phase {
+    font-size: 10px;
+    color: #57606a;
+    font-style: italic;
+  }
+
+  /* ── box ── */
+  .box {
+    flex: 1;
+    border-radius: 7px;
+    padding: 14px 16px;
+    margin: 6px 0;
+    position: relative;
+  }
+  .box-title {
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    letter-spacing: 0.01em;
+  }
+  .box-body {
+    font-size: 12px;
+    line-height: 1.65;
+    color: #1f2328;
+  }
+  .box-body code {
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: 11px;
+    background: rgba(0,0,0,0.05);
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+  .note {
+    font-size: 11px;
+    color: #57606a;
+    margin-top: 6px;
+    font-style: italic;
+  }
+
+  /* colour themes */
+  .c-entry  { background: #f0f4ff; border: 1.5px solid #3b82d4; }
+  .c-entry .box-title { color: #3b82d4; }
+
+  .c-utils  { background: #f7f8fa; border: 1.5px solid #8b949e; }
+  .c-utils .box-title { color: #1f2328; }
+
+  .c-wd     { background: #fff8f0; border: 1.5px solid #e08030; }
+  .c-wd .box-title { color: #b85c00; }
+
+  .c-kernel { background: #f0fff4; border: 1.5px solid #2da44e; }
+  .c-kernel .box-title { color: #1a7f37; }
+
+  .c-sdsc   { background: #fdf4ff; border: 1.5px solid #8250df; }
+  .c-sdsc .box-title { color: #6639ba; }
+
+  .c-json   { background: #fff0f0; border: 1.5px solid #cf222e; }
+  .c-json .box-title { color: #a40e26; }
+
+  /* ── arrow between steps ── */
+  .arrow-row {
+    display: flex;
+    align-items: center;
+    padding-left: 168px; /* label width + margin */
+  }
+  .arrow {
+    font-size: 18px;
+    color: #8b949e;
+    line-height: 1;
+    padding: 2px 0;
+  }
+
+  /* ── side note for parallel path ── */
+  .parallel-note {
+    margin-left: 168px;
+    margin-bottom: 4px;
+    margin-top: 2px;
+    font-size: 11px;
+    color: #b85c00;
+    font-style: italic;
+    border-left: 3px solid #e08030;
+    padding-left: 8px;
+  }
+
+  /* ── ShapeEnv lifetime bar ── */
+  .lifetime-bar {
+    position: relative;
+    margin-left: 168px;
+    margin-bottom: 10px;
+    font-size: 11px;
+    color: #57606a;
+    background: #fffbe6;
+    border: 1px dashed #d4a017;
+    border-radius: 4px;
+    padding: 5px 10px;
+  }
+
+  footer {
+    margin-top: 40px;
+    padding-top: 14px;
+    border-top: 1px solid #e5e7eb;
+    text-align: center;
+    font-size: 11px;
+    color: #8b949e;
+  }
+</style>
+</head>
+<body>
+
+<h1>Symbolic Shape Support — Compile-time Flow</h1>
+<p class="subtitle">From <code>mark_dynamic</code> to SDSC JSON emission  ·  torch-spyre</p>
+
+<div class="flow">
+
+  
+  <div class="step">
+    <div class="lane-label">
+      <div class="file">User code</div>
+      <div class="phase">before compile</div>
+    </div>
+    <div class="box c-entry">
+      <div class="box-title">mark_dynamic(tensor, dim=0, min=32, max=256)</div>
+      <div class="box-body">
+        Dynamo's <strong>ShapeEnv</strong> creates a sympy symbol <code>s97</code> and records its range <code>[32, 256]</code>.<br />
+        From this point, any size/stride that depends on dim 0 is a sympy expression, not a plain integer.<br />
+        <span class="note">ShapeEnv lives only during compilation — it will be gone by SDSC codegen time.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow-row"><div class="arrow">↓</div></div>
+
+  
+  <div class="step">
+    <div class="lane-label">
+      <div class="file">pass_utils.py</div>
+      <div class="phase">:148–345</div>
+    </div>
+    <div class="box c-utils">
+      <div class="box-title">Bound Extraction &amp; Bucket Computation</div>
+      <div class="box-body">
+        <code>finite_upper_or_none(s97)</code> → reads ShapeEnv upper bound → <strong>256</strong><br />
+        <code>_user_min_or_none(s97)</code> → reads ShapeEnv lower bound → <strong>32</strong><br />
+        <br />
+        <code>compute_max_size(s97)</code> → tries finite upper first; falls back to <code>optimization_hint</code> if not set<br />
+        <code>compute_granularity(s97, 256)</code> → user gave min=32; validates 256 % 32 == 0 and 256/32 = 8 ≤ MAX_BUCKETS(32)<br />
+        <code>compute_symbolic_bounds(s97)</code> → calls both above → returns <strong>(256, 32)</strong>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow-row"><div class="arrow">↓</div></div>
+  <div class="parallel-note">⚠ Work division runs as a PRE-SCHEDULING pass — before codegen. It independently re-reads ShapeEnv.</div>
+
+  
+  <div class="step">
+    <div class="lane-label">
+      <div class="file">work_division.py</div>
+      <div class="phase">:96–158, 947–994</div>
+    </div>
+    <div class="box c-wd">
+      <div class="box-title">Work Division (Core Split Planning)</div>
+      <div class="box-body">
+        <code>_collect_symbol_metadata(it_space)</code><br />
+          → independently calls <code>compute_max_size</code> + <code>compute_granularity</code><br />
+          → returns <code>SymbolMeta = { d0: (256, 32) }</code><br />
+        <br />
+        Two helpers used in every core-split decision:<br />
+        <code>_effective_size(d0, it_space, meta)</code> → <strong>max=256</strong> (worst-case footprint for span checks)<br />
+        <code>_valid_divisor_basis(d0, it_space, meta)</code> → <strong>gran=32</strong> (split must divide granularity, not max)<br />
+        <br />
+        Result: <code>op.op_it_space_splits = { d0: 4 }</code> — stamped directly onto the ComputedBuffer
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow-row"><div class="arrow">↓</div></div>
+
+  
+  <div class="step">
+    <div class="lane-label">
+      <div class="file">spyre_kernel.py</div>
+      <div class="phase">:879–895, 942–953</div>
+    </div>
+    <div class="box c-kernel">
+      <div class="box-title">create_op_spec() — Attach to OpSpec</div>
+      <div class="box-body">
+        Reads iteration space from IR node: <code>{ d0: (s97, 4),  d1: (512, 1) }</code><br />
+                                            ↑ still sympy   ↑ split from work division<br />
+        <br />
+        Calls <code>compute_symbolic_bounds(s97)</code> → <strong>(256, 32)</strong><br />
+        Freezes as plain ints — ShapeEnv dies after this point<br />
+        <code>symbolic_dim_bounds = { "s97": (256, 32) }</code> packed into OpSpec
+      </div>
+    </div>
+  </div>
+
+  <div class="lifetime-bar">
+    ⏱ ShapeEnv is now gone — everything below uses only the plain ints frozen into <code>symbolic_dim_bounds</code>
+  </div>
+
+  <div class="arrow-row"><div class="arrow">↓</div></div>
+
+  
+  <div class="step">
+    <div class="lane-label">
+      <div class="file">superdsc.py</div>
+      <div class="phase">:848–995</div>
+    </div>
+    <div class="box c-sdsc">
+      <div class="box-title">parse_op_spec() — SDSC Size Resolution</div>
+      <div class="box-body">
+        <strong>1. Rename dims</strong> (Inductor name → SDSC hardware name):<br />
+          <code>symbol_mapping = { d0 → M,  d1 → K }</code><br />
+        <br />
+        <strong>2. Resolve sizes to concrete ints</strong>:<br />
+          <code>_resolve_sdsc_size(s97, bounds)</code> → s97 is symbolic → return <code>bounds["s97"][0]</code> = <strong>256</strong><br />
+          <code>sdsc_iteration_space = { M: 256,  K: 512 }</code> — JSON-ready concrete ints<br />
+        <br />
+        <strong>3. Re-package for JSON writer</strong>:<br />
+          <code>symbolic_dims = { "M": ("s97", 32, 256) }</code>
+        <span class="note">Same data as symbolic_dim_bounds, re-keyed from "s97" to "M" (the SDSC dim label)</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="arrow-row"><div class="arrow">↓</div></div>
+
+  
+  <div class="step">
+    <div class="lane-label">
+      <div class="file">compute_ops.py</div>
+      <div class="phase">:588–604, 1191–1237</div>
+    </div>
+    <div class="box c-json">
+      <div class="box-title">generate_sdsc() — SDSC JSON Emission</div>
+      <div class="box-body">
+        <strong>Register dim symbol before address symbols</strong> (IDs must never collide):<br />
+          <code>dim_local_symbols = { "s97": -1 }</code>  ← negative ID, no HBM address<br />
+        <br />
+        <strong>Write JSON key 1 — dimToSymbolMapping_:</strong><br />
+          <code>{ "M": [-1] }</code><br />
+          → tells runtime: read actual tensor size and bind it to symbol -1<br />
+        <br />
+        <strong>Write JSON key 2 — symbolicDimInfo_:</strong><br />
+          <code>{ M: { maxSize_: 64, granularity_: 8 } }</code><br />
+          → per-core values (256 / 4 splits = 64,  32 / 4 splits = 8)<br />
+          → tells runtime: value must be ≤ 64/core and a multiple of 8/core
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<footer>Made with IBM Bob</footer>
+</body>
+</html>
