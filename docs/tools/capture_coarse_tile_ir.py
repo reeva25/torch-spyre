@@ -31,8 +31,6 @@ import glob
 import logging
 import os
 import sys
-from unittest.mock import patch as mock_patch
-
 import torch
 
 sys.path.insert(
@@ -49,9 +47,6 @@ from torch_spyre._inductor.wsr import propagate_named_dims as _pnd  # noqa: E402
 _declare_tensor_dim = _pnd.declare_tensor_dim
 _name_tensor_dims = _pnd.name_tensor_dims
 from torch_spyre._inductor import spyre_hint  # noqa: E402
-
-_LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
-_PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 DEVICE = torch.device("spyre")
 
@@ -139,12 +134,7 @@ def main() -> None:
         print("BEGIN graph.operations IR dump (interleaved via logger)")
         print("=" * 80)
 
-        with (
-            mock_patch(_LAUNCH_JOBPLAN),
-            mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
-        ):
-            _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
+        _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
 
         print("=" * 80)
         print("END graph.operations IR dump")

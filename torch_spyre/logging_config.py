@@ -72,6 +72,57 @@ def _get_lock():
     return _lock
 
 
+def _parse_spyre_log_env(var_name: str, env_value: str) -> Dict[str, LogLevel]:
+    """Parse a spyre-specific log variable using the same format as TORCH_LOGS.
+
+    Supported formats (same as TORCH_LOGS but only spyre namespaces):
+    - "spyre.inductor.passes:INFO"
+    - "+spyre.inductor.passes"   (enables at INFO)
+    - "-spyre.inductor.passes"   (disables)
+    - "spyre.inductor.passes:INFO,spyre.inductor:DEBUG"
+
+    Args:
+        var_name: The environment variable name (used only for _config_source tracking).
+        env_value: The raw string value of the variable.
+
+    Returns:
+        Dictionary mapping component names to log levels
+    """
+    config: Dict[str, LogLevel] = {}
+
+    for entry in env_value.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+
+        if entry.startswith("+"):
+            component = entry[1:]
+            if component.startswith("spyre"):
+                config[component] = LogLevel.INFO
+                _config_source[component] = var_name
+        elif entry.startswith("-"):
+            component = entry[1:]
+            if component.startswith("spyre"):
+                config[component] = LogLevel.DISABLED
+                _config_source[component] = var_name
+        elif ":" in entry:
+            component, level_str = entry.split(":", 1)
+            component = component.strip()
+            level_str = level_str.strip()
+            if component.startswith("spyre"):
+                try:
+                    level = getattr(LogLevel, level_str.upper())
+                    config[component] = level
+                    _config_source[component] = var_name
+                except AttributeError:
+                    warnings.warn(
+                        f"Invalid log level '{level_str}' for {component} in {var_name}",
+                        stacklevel=3,
+                    )
+
+    return config
+
+
 def _parse_torch_logs() -> Dict[str, LogLevel]:
     """Parse TORCH_LOGS environment variable for spyre namespaces.
 
@@ -183,10 +234,11 @@ def _resolve_config() -> Dict[str, LogLevel]:
     """Resolve final configuration from all sources.
 
     Priority order:
-    1. TORCH_LOGS
-    2. Legacy environment variables
-    3. Programmatic API (applied later)
-    4. Defaults
+    1. SPYRE_LOG (spyre-specific, highest priority — never clashes with PyTorch's TORCH_LOGS)
+    2. TORCH_LOGS (spyre.* entries only)
+    3. Legacy environment variables
+    4. Programmatic API (applied later)
+    5. Defaults
 
     Returns:
         Resolved configuration dictionary
@@ -199,13 +251,19 @@ def _resolve_config() -> Dict[str, LogLevel]:
     torch_logs_config = _parse_torch_logs()
     config.update(torch_logs_config)
 
+    spyre_log_value = os.environ.get("SPYRE_LOG", "")
+    if spyre_log_value:
+        spyre_log_config = _parse_spyre_log_env("SPYRE_LOG", spyre_log_value)
+        config.update(spyre_log_config)
+
     # When a user explicitly configures a parent component, propagate that
     # level to any more-specific defaults that would otherwise shadow it.
-    # For example, TORCH_LOGS='+spyre.inductor' should override the default
+    # For example, SPYRE_LOG='+spyre.inductor' should override the default
     # WARNING entry for 'spyre.inductor.codegen' so that child loggers like
     # 'spyre.inductor.codegen.superdsc' resolve to the user-specified level.
     explicit_sources = {
         "TORCH_LOGS",
+        "SPYRE_LOG",
         "legacy:SPYRE_INDUCTOR_LOG",
         "legacy:TORCH_SPYRE_DEBUG",
     }
@@ -247,7 +305,14 @@ def configure_python_logging():
 
     with _get_lock():
         spyre_logger = logging.getLogger("spyre")
-        spyre_logger.setLevel(int(get_log_level("spyre")))
+        # Set the root handler to the minimum level across all configured
+        # components so it never blocks a child logger that has been
+        # deliberately lowered (e.g. SPYRE_LOG="spyre.inductor.passes:INFO"
+        # while "spyre" itself remains at WARNING).
+        min_level = min(int(level) for level in _config.values()) if _config else int(get_log_level("spyre"))
+        import sys
+        print(f"[spyre logging_config] configure_python_logging: SPYRE_LOG={os.environ.get('SPYRE_LOG')!r}  _config={dict(_config)}  min_level={min_level}", file=sys.stderr, flush=True)
+        spyre_logger.setLevel(min_level)
 
         desired_file = _log_file_path
         formatter = _make_formatter()

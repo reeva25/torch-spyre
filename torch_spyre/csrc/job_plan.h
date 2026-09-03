@@ -429,9 +429,11 @@ class JobPlanStepHostCompute final : public JobPlanStep {
    * @param ishape used for constructing input buffer
    */
   JobPlanStepHostCompute(std::unique_ptr<Hcm> hcm, void* output_buffer,
+                         size_t output_buffer_size,
                          const void* input_buffer, std::vector<int64_t> ishape)
       : hcm_(std::move(hcm)),
         output_buffer_(output_buffer),
+        output_buffer_size_(output_buffer_size),
         input_buffer_(input_buffer),
         ishape_(ishape) {
     pipeline_barrier_ = false;  // host callbacks are overlap-eligible
@@ -444,6 +446,7 @@ class JobPlanStepHostCompute final : public JobPlanStep {
  private:
   std::unique_ptr<Hcm> hcm_;
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
+  size_t output_buffer_size_{0};
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
 };

@@ -244,31 +244,31 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
   RECORD_FUNCTION("launch::H2D", {});
-  std::cout << "STEP 14 SpyreStream::launchH2D: resolving runtime handle for stream_id="
-            << id() << std::endl;
+  // std::cout << "STEP 14 SpyreStream::launchH2D: resolving runtime handle for stream_id="
+  //           << id() << std::endl;
   resolveRuntimeHandle()->launchOperationH2D(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
   RECORD_FUNCTION("launch::D2H", {});
-  std::cout << "STEP 14 SpyreStream::launchD2H: resolving runtime handle for stream_id="
-            << id() << std::endl;
+  // std::cout << "STEP 14 SpyreStream::launchD2H: resolving runtime handle for stream_id="
+  //           << id() << std::endl;
   resolveRuntimeHandle()->launchOperationD2H(params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
   RECORD_FUNCTION("launch::Compute", {});
-  std::cout
-      << "STEP 14 SpyreStream::launchCompute: resolving runtime handle for stream_id="
-      << id() << std::endl;
+  // std::cout
+  //     << "STEP 14 SpyreStream::launchCompute: resolving runtime handle for stream_id="
+  //     << id() << std::endl;
   resolveRuntimeHandle()->launchOperationCompute(params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   RECORD_FUNCTION("launch::HostCallback", {});
-  std::cout
-      << "STEP 14 SpyreStream::launchHostCallback: resolving runtime handle for stream_id="
-      << id() << std::endl;
+  // std::cout
+  //     << "STEP 14 SpyreStream::launchHostCallback: resolving runtime handle for stream_id="
+  //     << id() << std::endl;
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
@@ -286,8 +286,8 @@ void SpyreStream::launch(const JobPlan& plan,
                 " must be on Spyre device, got ", args[i].device());
   }
 
-  std::cout << "STEP 12 SpyreStream::launch: stream_id=" << id() << " steps="
-            << plan.steps.size() << " tensors=" << args.size() << std::endl;
+  // std::cout << "STEP 12 SpyreStream::launch: stream_id=" << id() << " steps="
+  //           << plan.steps.size() << " tensors=" << args.size() << std::endl;
 
   // Create launch context with tensor arguments
   LaunchContext ctx{args};
@@ -295,12 +295,12 @@ void SpyreStream::launch(const JobPlan& plan,
   // Each JobPlanStep builds its flex operation params and launches them on
   // this stream in order. flex owns the RuntimeOperation lifecycle.
   for (size_t i = 0; i < plan.steps.size(); ++i) {
-    std::cout << "STEP 12 SpyreStream::launch: constructing step " << i
-              << " of " << plan.steps.size() << std::endl;
+    // std::cout << "STEP 12 SpyreStream::launch: constructing step " << i
+    //           << " of " << plan.steps.size() << std::endl;
     plan.steps[i]->construct(ctx, *this);
   }
-  std::cout << "STEP 12 SpyreStream::launch: all steps submitted to stream_id="
-            << id() << std::endl;
+  // std::cout << "STEP 12 SpyreStream::launch: all steps submitted to stream_id="
+  //           << id() << std::endl;
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {

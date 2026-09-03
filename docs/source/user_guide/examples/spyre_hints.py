@@ -25,9 +25,9 @@ d = torch.rand(64, 256, dtype=torch.float16)  # M N
 
 
 def f(a, b, c, d):
+    with spyre_hint(tiles={"M": 4}):
+        x = a + b
     with spyre_hint(tiles={"K": 2}):
-        with spyre_hint(tiles={"M": 4}):
-            x = a + b
         y = x @ c
     return y + d
 

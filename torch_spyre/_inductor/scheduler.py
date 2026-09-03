@@ -740,11 +740,11 @@ class SuperDSCScheduling(BaseScheduling):
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()
             first_line = f"async_compile.{method}('{kernel_name}',"
-            print(
-                "STEP 1 define_kernel: generated wrapper line:",
-                first_line,
-                flush=True,
-            )
+            # print(
+            #     "STEP 1 define_kernel: generated wrapper line:",
+            #     first_line,
+            #     flush=True,
+            # )
             buf.writeline(first_line)
             with buf.indent():
                 buf.splice(f"{src_code}")

@@ -16,6 +16,8 @@
 
 #include "job_plan.h"
 
+#include <cctype>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <utility>
@@ -35,9 +37,9 @@ void JobPlanStepH2D::construct(LaunchContext&,
       flex::createDmaParams(host_address_, device_address_.total_size(),
                             /*to_device=*/true, &device_address_);
   params->pipeline_barrier = pipeline_barrier_;
-  std::cout << "STEP 13 JobPlanStepH2D::construct: size="
-            << device_address_.total_size()
-            << " pipeline_barrier=" << pipeline_barrier_ << std::endl;
+  // std::cout << "STEP 13 JobPlanStepH2D::construct: size="
+  //           << device_address_.total_size()
+  //           << " pipeline_barrier=" << pipeline_barrier_ << std::endl;
   stream.launchH2D(params);
   flex::destroyDmaParams(params);
 }
@@ -59,9 +61,9 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address.total_size(),
                               /*to_device=*/false, &device_address);
     params->pipeline_barrier = pipeline_barrier_;
-    std::cout << "STEP 13 JobPlanStepD2H::construct: composite-address size="
-              << device_address.total_size() << " pipeline_barrier="
-              << pipeline_barrier_ << std::endl;
+    // std::cout << "STEP 13 JobPlanStepD2H::construct: composite-address size="
+    //           << device_address.total_size() << " pipeline_barrier="
+    //           << pipeline_barrier_ << std::endl;
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   } else {
@@ -96,9 +98,9 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
     params->callback = [device_address](void*) {};
-    std::cout << "STEP 13 JobPlanStepD2H::construct: tensor-segment size="
-              << device_address->total_size() << " pipeline_barrier="
-              << pipeline_barrier_ << std::endl;
+    // std::cout << "STEP 13 JobPlanStepD2H::construct: tensor-segment size="
+    //           << device_address->total_size() << " pipeline_barrier="
+    //           << pipeline_barrier_ << std::endl;
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -132,11 +134,11 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   auto* params = flex::createComputeParams(
       &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
   params->pipeline_barrier = pipeline_barrier_;
-  std::cout << "STEP 13 JobPlanStepCompute::construct: submitting compute name='"
-            << name_ << "' bootstrap_offset=0x" << std::hex
-            << bootstrap_offset_ << std::dec << " bind_io="
-            << bind_io_addresses_ << " pipeline_barrier=" << pipeline_barrier_
-            << std::endl;
+  // std::cout << "STEP 13 JobPlanStepCompute::construct: submitting compute name='"
+  //           << name_ << "' bootstrap_offset=0x" << std::hex
+  //           << bootstrap_offset_ << std::dec << " bind_io="
+  //           << bind_io_addresses_ << " pipeline_barrier=" << pipeline_barrier_
+  //           << std::endl;
   stream.launchCompute(params);
   flex::destroyComputeParams(params);
 }
@@ -151,8 +153,50 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
+static void printHexDump(const void* ptr, size_t size, std::ostream& os = std::cout) {
+  if (!ptr || size == 0) {
+    os << "    (empty buffer)\n";
+    return;
+  }
+  const auto* bytes = static_cast<const uint8_t*>(ptr);
+  size_t limit = (size > 256) ? 256 : size;
+
+  for (size_t i = 0; i < limit; i += 16) {
+    os << "    " << std::setw(6) << std::setfill('0') << std::hex << i << "  ";
+
+    // Hex bytes
+    for (size_t j = 0; j < 16; ++j) {
+      if (i + j < limit) {
+        os << std::setw(2) << std::setfill('0') << std::hex
+           << static_cast<int>(bytes[i + j]) << " ";
+      } else {
+        os << "   ";
+      }
+      if (j == 7) os << " ";
+    }
+
+    os << " |";
+    // Printable ASCII characters
+    for (size_t j = 0; j < 16 && (i + j) < limit; ++j) {
+      char c = static_cast<char>(bytes[i + j]);
+      os << (std::isprint(static_cast<unsigned char>(c)) ? c : '.');
+    }
+    os << "|\n";
+  }
+
+  if (size > limit) {
+    os << "    ... (" << std::dec << (size - limit) << " more bytes not shown)\n";
+  }
+  os << std::dec << std::setfill(' ');
+}
+
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
+  std::cout << "\n===============================================================\n";
+  std::cout << "[PROGRAM CORRECTION] Running Step 1/3: HostCompute (CPU)\n";
+  std::cout << "  * Output Patch Buffer : " << output_buffer_
+            << " (" << output_buffer_size_ << " bytes in Pinned Host RAM)\n";
+
   // Helper lambda to build HostCallbackParams and launch on the stream.
   // flex::RuntimeStream::launchOperationHostCallback() invokes the callback
   // synchronously in the calling thread, so exceptions propagate directly
@@ -168,28 +212,34 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
         flex::destroyHostCallbackParams(p);
       }
     } guard{params};
-    std::cout
-        << "STEP 13 JobPlanStepHostCompute::construct: launching host callback"
-        << " pipeline_barrier=" << pipeline_barrier_ << std::endl;
     stream.launchHostCallback(params);
   };
 
   // Case 1: input_buffer_ is provided
   if (input_buffer_ != nullptr) {
+    std::cout << "  * Execution Mode      : Input Buffer provided ("
+              << input_buffer_ << ")\n";
     launch_host_callback([this](void*) {
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
                                              input_buffer_);
     });
+    std::cout << "\n  * [HEX DUMP] Output Patch Buffer Contents (Post-Correction):\n";
+    printHexDump(output_buffer_, output_buffer_size_);
+    std::cout << "  * Status: Patch blob generated successfully.\n";
+    std::cout << "===============================================================\n\n";
     return;
   }
 
   // Case 2: fake symbols (ishape_ is {0})
-  // Further discussion is required on "ishape". For now, it's vector<int64_t>,
-  // and it's {0}, it's for fake symbols
   if (ishape_.size() == 1 && ishape_[0] == 0) {
+    std::cout << "  * Execution Mode      : Fake Symbols (ishape={0})\n";
     launch_host_callback([this](void*) {
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, nullptr);
     });
+    std::cout << "\n  * [HEX DUMP] Output Patch Buffer Contents (Post-Correction):\n";
+    printHexDump(output_buffer_, output_buffer_size_);
+    std::cout << "  * Status: Patch blob generated successfully.\n";
+    std::cout << "===============================================================\n\n";
     return;
   }
 
@@ -197,22 +247,57 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   std::vector<int64_t> addresses(ctx.inputs_outputs.size());
   int addr_idx = 0;
   auto& allocator = SpyreAllocator::instance();
+
+  std::cout << "  * Execution Mode      : Live Tensor Address Extraction ("
+            << ctx.inputs_outputs.size() << " argument(s))\n";
+  std::cout << "  * Resolved Runtime DMVAs (Pointers on Spyre Device):\n";
+
   for (auto& tensor : ctx.inputs_outputs) {
     int64_t addr = allocator.compositeAddressToDmva(
         (static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
              ->composite_addr));
-    addresses[addr_idx++] = addr;
+    addresses[addr_idx] = addr;
+
+    uint64_t uaddr = static_cast<uint64_t>(addr);
+    auto segment_id = flex::dmvaToSegmentId(uaddr);
+
+    std::cout << "    [" << addr_idx << "] DMVA = 0x"
+              << std::setw(16) << std::setfill('0') << std::hex << uaddr
+              << std::dec << std::setfill(' ')
+              << " | Segment " << segment_id
+              << " | Shape: " << tensor.sizes()
+              << " | Dtype: " << tensor.scalar_type()
+              << " | Bytes: " << tensor.nbytes()
+              << "\n";
+    addr_idx++;
   }
+
+  std::cout << "  * Calling deeptools::processComputeOnHostCommand to encode patch...\n";
 
   launch_host_callback([this, addresses](void*) {
     deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, &addresses);
   });
+
+  std::cout << "\n  * [HEX DUMP] Output Patch Buffer Contents (Post-Correction):\n";
+  printHexDump(output_buffer_, output_buffer_size_);
+
+  std::cout << "  * Status: Patch blob generated.\n";
+  std::cout << "  * Next Steps:\n";
+  std::cout << "      Step 2/3 (H2D)     : DMA patch blob -> Segment 7 Correction Region on Device\n";
+  std::cout << "      Step 3/3 (Compute) : Device executes kernel at bootstrap_offset with resolved addresses\n";
+  std::cout << "===============================================================\n\n";
 }
 
 void JobPlanStepHostCompute::write(std::ostream& os) const {
-  os << "  Host Compute\n";
-  os << "    Output buffer: " << output_buffer_ << "\n";
-  os << "    HCM metadata: " << (hcm_ ? "present" : "null") << "\n";
+  os << "  Host Compute (Program Correction Step 1/3)\n";
+  os << "    Output buffer: " << output_buffer_ << " (" << output_buffer_size_
+     << " bytes)\n";
+  if (hcm_) {
+    os << "    HCM Compiler Recipe JSON:\n"
+       << hcm_->exportJsonStr("      ") << "\n";
+  } else {
+    os << "    HCM Compiler Recipe: null\n";
+  }
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }

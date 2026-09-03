@@ -479,6 +479,7 @@ class CustomPreSchedulingPasses:
 
         for pass_fn in self.passes:
             pass_name = _get_pass_name(pass_fn)
+            logger.info("[wsr] -> %s", pass_name)
             # `graph` is the same object throughout -- passes mutate
             # `graph.operations` in place -- so before/after reconciliation
             # is exact here.
@@ -487,12 +488,7 @@ class CustomPreSchedulingPasses:
                 pass_fn(graph)
                 elapsed_ms = (time.perf_counter() - t0) * 1000
 
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "elapsed %5dms  %s",
-                    elapsed_ms,
-                    pass_name,
-                )
+            logger.info("[wsr] <- %s  %.1fms", pass_name, elapsed_ms)
             if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
                 logger.debug(
                     "AFTER %s\n%s", pass_name, format_operations(graph.operations)

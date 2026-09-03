@@ -42,21 +42,21 @@ class SpyreSDSCKernelRunner:
         self.kernel_name = name
         self.code_dir = code_dir
         spyrecode_dir = code_dir + "/spyreCodeDir"
-        print(
-            f"STEP 5 SpyreSDSCKernelRunner.__init__: calling prepare_kernel for '{name}' with spyrecode_dir={spyrecode_dir}",
-            flush=True,
-        )
+        # print(
+        #     f"STEP 5 SpyreSDSCKernelRunner.__init__: calling prepare_kernel for '{name}' with spyrecode_dir={spyrecode_dir}",
+        #     flush=True,
+        # )
         self.jobplan = prepare_kernel(spyrecode_dir)
-        print(
-            f"STEP 5 SpyreSDSCKernelRunner.__init__: prepare_kernel complete for '{name}'; steps={self.jobplan.num_steps()}",
-            flush=True,
-        )
+        # print(
+        #     f"STEP 5 SpyreSDSCKernelRunner.__init__: prepare_kernel complete for '{name}'; steps={self.jobplan.num_steps()}",
+        #     flush=True,
+        # )
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
     def run(self, *args, **kw_args):
-        print(
-            f"STEP 10 SpyreSDSCKernelRunner.run: launching '{self.kernel_name}' with {len(args)} live tensor args",
-            flush=True,
-        )
+        # print(
+        #     f"STEP 10 SpyreSDSCKernelRunner.run: launching '{self.kernel_name}' with {len(args)} live tensor args",
+        #     flush=True,
+        # )
         with torch.profiler.record_function(f"launch_jobplan:{self.kernel_name}"):
             launch_jobplan(self.jobplan, args)
