@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Union
+from typing import Iterator, Sequence, Union
 
 import sympy
 
@@ -23,6 +23,7 @@ from torch._inductor.utils import (
     sympy_product,
 )
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import NoneLayout
 from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
@@ -34,10 +35,16 @@ from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
-from .pass_utils import iteration_space, per_core_view_scheduled
+from .ir import FixedTiledLayout
+from .pass_utils import iteration_space
 from .logging_utils import get_inductor_logger
+from .scratchpad.lx_relayout import (
+    demote_lx_relayout_group,
+    materialized_lx_relayout_for_destination,
+)
 from .op_spec import LoopSpec
 from . import config as _spyre_config
+from .errors import Unsupported
 
 logger = get_inductor_logger("scheduler")
 
@@ -315,163 +322,212 @@ def build_loop_scheduler_nodes(
     return result
 
 
-def _lx_resident(node: SchedulerNode) -> bool:
-    """True if ``node``'s output buffer was pinned into LX by scratchpad planning."""
-    allocation = getattr(getattr(node.node, "layout", None), "allocation", None)
-    return allocation is not None and "lx" in allocation
+def _lx_layout(name: str):
+    buffer = V.graph.try_get_buffer(name)
+    if buffer is None:
+        return None
+    # Fallback kernels can register dependency-only buffers whose NoneLayout
+    # intentionally has no tensor descriptor.  Such a buffer cannot be LX
+    # resident, and Buffer.get_layout() raises for it by contract.
+    if isinstance(getattr(buffer, "layout", None), NoneLayout):
+        return None
+    layout = buffer.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        return None
+    if "lx" not in layout.allocation:
+        return None
+    return layout
 
 
-def align_lx_producer_loop_order(
+def _all_scheduler_nodes(
+    items: Sequence[BaseSchedulerNode],
+) -> Iterator[SchedulerNode]:
+    """Yield every leaf operation, including leaves inside counted loops."""
+
+    for item in items:
+        if isinstance(item, FusedSchedulerNode):
+            yield from _all_scheduler_nodes(item.get_nodes())
+        elif isinstance(item, SchedulerNode):
+            yield item
+
+
+def _touched_lx_names(node: SchedulerNode) -> list[str]:
+    """The LX buffers one operation reads or writes."""
+
+    return [
+        dep.name
+        for dep in (*node.read_writes.reads, *node.read_writes.writes)
+        if isinstance(dep, MemoryDep) and _lx_layout(dep.name) is not None
+    ]
+
+
+def prepare_spyre_kernels(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    """Pre-fusion pass: match an LX buffer's producer loop order to its consumers'.
+    """Prepare every bundle's kernel once, while HBM fallback is still available.
 
-    LX is per-core scratchpad, so every op touching an LX-resident buffer must
-    agree on which core owns which slice.  That mapping is *positional*:
-    ``core_to_slice_mapping`` hands out ``core_id`` strides in iteration-space
-    order, so a producer that walks the buffer in a different dim order than its
-    consumers read it gets a transposed core->slice assignment.  The split
-    factors still multiply to the same core count, so nothing downstream
-    complains -- each core simply reads the slice a different core wrote, and the
-    kernel silently returns another core's data.
-
-    Scratchpad planning creates the clone that pins a graph input into LX, and it
-    builds that clone in the buffer's natural dim order, which need not match how
-    the consumers read it.  Through PyTorch 2.12 Inductor's
-    ``loop_ordering_after_fusion`` happened to rewrite the clone into the
-    consumers' order, so the assignments lined up by accident.  As of 2.13 the
-    reorder is computed and then discarded (see
-    ``Scheduler._try_reorder_loops_for_candidates``), which exposed the
-    incoherence as wrong results for any two reductions sharing one LX-pinned
-    input.  Align the orders here so correctness does not rest on an Inductor
-    scoring heuristic.
-
-    Consumers of an LX buffer are already known to agree with each other -- a
-    disagreement is a core-division mismatch that keeps the buffer in HBM (see
-    ``get_ncores_for_buffers``) -- so matching the first consumer matches all.
+    Planning has already chosen each LX buffer's physical ownership. This pass
+    does not choose it again: it runs the real operation handlers and the real
+    finalization over every bundle and keeps each successful kernel for
+    emission. An operation whose LX placement cannot be finalized demotes the
+    LX buffers it touches (a relayout member takes its whole connected group),
+    and every kernel that touched a demoted buffer is prepared again, until no
+    placement changes. Each retry removes at least one finite LX allocation.
     """
-    producers: dict[str, SchedulerNode] = {}
-    for node in nodes:
-        if isinstance(node, SchedulerNode) and _lx_resident(node):
-            for dep in node.read_writes.writes:
-                if isinstance(dep, MemoryDep):
-                    producers[dep.name] = node
+    scheduler = V.graph.scheduler
+    bundles = [
+        node
+        for node in nodes
+        if isinstance(node, (FusedSchedulerNode, SchedulerNode))
+        and not (node.is_template() or node.is_extern() or node.is_foreach())
+        and isinstance(scheduler.get_backend(node.get_device()), SuperDSCScheduling)
+    ]
+    leaves = list(_all_scheduler_nodes(bundles))
 
-    if not producers:
-        return nodes
+    def demote(name: str, reason: str) -> None:
+        # Scheduling supplies the final ownership verdict; the relayout layer
+        # owns the fallback for a whole connected group, and for a buffer with
+        # no registered copies that group is the buffer itself. A destination
+        # demoted after its group is already gone is cleared again, harmlessly.
+        plan = materialized_lx_relayout_for_destination(V.graph, name)
+        demote_lx_relayout_group(
+            V.graph, name if plan is None else plan.source_name, reason
+        )
 
-    # Keyed by producer, not by buffer: reordering a producer twice would leave
-    # it matching only whichever consumer came last.  A ComputedBuffer has a
-    # single output (multi-output ops carry no device_layout and never reach LX),
-    # so one alignment per producer covers every LX buffer it writes.
-    aligned: OrderedSet[str] = OrderedSet()
-    for node in nodes:
-        if not isinstance(node, SchedulerNode):
+    # One attempt prepares every bundle in order. A rejected placement demotes
+    # the failing operation's LX buffers, the attempt's kernels and graph
+    # removals are dropped, and the next attempt starts over, so every kernel
+    # emission consumes was prepared against the final placement.
+    removed_at_entry = OrderedSet(V.graph.removed_buffers)
+    initial_lx_names = {name for node in leaves for name in _touched_lx_names(node)}
+    for _ in range(len(initial_lx_names) + 1):
+        kernels = []
+        for bundle in bundles:
+            backend = scheduler.get_backend(bundle.get_device())
+            kernel = SpyreKernel()
+            try:
+                backend.prepare_kernel(bundle, kernel)
+            except (Unsupported, ValueError) as exc:
+                # A rejected attempt leaves nothing behind: its kernels are
+                # dropped and the graph's removed-buffer set is restored.
+                V.graph.removed_buffers -= V.graph.removed_buffers - removed_at_entry
+                failed = kernel.failed_node
+                touched = [] if failed is None else _touched_lx_names(failed)
+                if failed is None or not touched:
+                    raise
+                reason = f"{failed.get_name()} LX ownership finalization failed: {exc}"
+                # This is a preservation check, not another placement search.
+                # Do not try subsets or keep a preferred writer: all LX buffers
+                # touched by the failed operation fall back together.
+                for touched_name in touched:
+                    demote(touched_name, reason)
+                break
+            kernels.append((bundle, kernel))
+        else:
+            for bundle, kernel in kernels:
+                setattr(bundle, "prepared_kernel", kernel)
+            return nodes
+    raise RuntimeError(
+        "LX ownership finalization did not reach its monotone demotion fixed point"
+    )
+
+
+def verify_carried_reduction_ownership(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Require carried-reduction stages and their committed LX ownership to survive.
+
+    Kernel preparation already proved each access against the physical view.
+    After HBM-pool planning, check that the stages, accesses, and view still exist.
+    """
+
+    grouped: dict[object, dict[str, SchedulerNode]] = {}
+    for node in _all_scheduler_nodes(nodes):
+        record = getattr(node.node, "_carried_reduction_record", None)
+        if record is not None:
+            grouped.setdefault(record, {})[node.get_name()] = node
+
+    for record, by_name in grouped.items():
+        expected_names = {
+            record.fill_name,
+            record.combine_name,
+            record.drain_name,
+        }
+        missing = expected_names - by_name.keys()
+        if missing:
+            raise Unsupported(
+                "carried reduction lost physical stages after fusion: "
+                f"accumulator={record.accumulator_name}, missing={sorted(missing)}"
+            )
+
+        accumulator = V.graph.try_get_buffer(record.accumulator_name)
+        if accumulator is None:
+            raise Unsupported(
+                f"carried reduction accumulator {record.accumulator_name} is missing"
+            )
+        layout = accumulator.get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            raise Unsupported(
+                f"carried reduction accumulator {record.accumulator_name} has "
+                f"non-device layout {type(layout).__name__}"
+            )
+        if "lx" not in layout.allocation:
+            logger.info(
+                "carried reduction %s remained in HBM; execution is correct but "
+                "the persistent-LX performance contract was not realized",
+                record.accumulator_name,
+            )
             continue
-        for read in node.read_writes.reads:
-            if not isinstance(read, MemoryDep):
-                continue
-            producer = producers.get(read.name)
-            if producer is None or producer is node:
-                continue
-            if producer.get_name() in aligned:
-                continue
-            write = next(
+
+        checks = (
+            (record.fill_name, "write"),
+            (record.combine_name, "read"),
+            (record.combine_name, "write"),
+            (record.drain_name, "read"),
+        )
+        if layout.lx_view is None:
+            raise Unsupported(
+                f"carried reduction accumulator {record.accumulator_name} has "
+                "an LX address but no physical ownership"
+            )
+        for op_name, access in checks:
+            node = by_name[op_name]
+            deps = (
+                node.read_writes.reads if access == "read" else node.read_writes.writes
+            )
+            dep = next(
                 (
-                    dep
-                    for dep in producer.read_writes.writes
-                    if isinstance(dep, MemoryDep) and dep.name == read.name
+                    candidate
+                    for candidate in deps
+                    if isinstance(candidate, MemoryDep)
+                    and candidate.name == record.accumulator_name
                 ),
                 None,
             )
-            if write is None:
-                continue
-            # Reorders `producer`'s loops so its write dep matches `read`.
-            if producer.reorder_loops_by_dep_pair(write, read):
-                aligned.add(producer.get_name())
-                logger.debug(
-                    "align_lx_producer_loop_order: %s reordered to match %s's "
-                    "read of LX buffer %s",
-                    producer.get_name(),
-                    node.get_name(),
-                    read.name,
+            if dep is None and access == "write" and op_name == record.combine_name:
+                # MutationLayout's scheduled write is named after the combine
+                # op, while its storage target is the carried accumulator.
+                memory_deps = [
+                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
+                ]
+                dep = memory_deps[0] if len(memory_deps) == 1 else None
+            if dep is None and access == "read" and op_name == record.drain_name:
+                # Mutation propagation names this dependency after the latest
+                # in-place writer, but it still reads the accumulator storage.
+                memory_deps = [
+                    candidate for candidate in deps if isinstance(candidate, MemoryDep)
+                ]
+                dep = memory_deps[0] if len(memory_deps) == 1 else None
+            if dep is None:
+                raise Unsupported(
+                    f"carried reduction {op_name} lost its {access} of "
+                    f"{record.accumulator_name}; deps="
+                    f"{[(type(candidate).__name__, candidate.name) for candidate in deps]}"
                 )
-
-    return nodes
-
-
-def demote_incoherent_lx_buffers(
-    nodes: list[BaseSchedulerNode],
-) -> list[BaseSchedulerNode]:
-    """Post-fusion pass: drop an LX buffer whose users disagree on core->slice.
-
-    LX planning runs before the Scheduler exists, so it reasons about each op's
-    *pre*-scheduler ranges. ``core_to_slice_mapping`` is positional -- it hands
-    ``core_id`` strides out in iteration-space order -- and Inductor's
-    ``loop_ordering_after_fusion`` may permute a fused op's ranges after planning
-    has already committed. When it permutes one user of an LX buffer and not
-    another, the two disagree about which core owns which slice: each core writes
-    one slice and reads back a different one. LX is per-core scratchpad with no
-    other copy, so the read is silently wrong (#2062).
-
-    Planning cannot see that permutation, so re-check here, where the ranges are
-    final, and demote any buffer whose users no longer agree. Clearing ``"lx"``
-    is all that is needed: this runs before ``hbm_pool_planning``, which claims
-    exactly the intermediates LX did not, so a demoted buffer lands in the HBM
-    intermediates segment on its way through.
-
-    Deliberately verification-only -- it never *adds* residency and never
-    rewrites a loop order, so it cannot perturb a graph whose users already
-    agree.
-
-    Complements :func:`align_lx_producer_loop_order`, which runs pre-fusion and
-    rewrites a producer's loop order to match its consumers'. That pass fixes the
-    incoherence it can reach; this one is the backstop for what it cannot -- a
-    disagreement introduced after it ran, or a view too irregular to represent --
-    where the only safe answer is to give up LX residency.
-    """
-    if not _spyre_config.lx_planning:
-        return nodes
-
-    # dep is needed per (node, buffer): a node reading and writing the same
-    # buffer contributes one entry per access, so an in-place op whose read and
-    # write views diverge is caught too.
-    users: dict[str, list[tuple[SchedulerNode, MemoryDep]]] = {}
-    lx_names: OrderedSet[str] = OrderedSet()
-    for node in nodes:
-        for inner in node.get_nodes():
-            if not isinstance(inner, SchedulerNode):
-                continue
-            if _lx_resident(inner):
-                for dep in inner.read_writes.writes:
-                    if isinstance(dep, MemoryDep):
-                        lx_names.add(dep.name)
-            rw = inner.read_writes
-            for dep in list(rw.reads) + list(rw.writes):
-                if isinstance(dep, MemoryDep):
-                    users.setdefault(dep.name, []).append((inner, dep))
-
-    for name in lx_names:
-        ref = None
-        culprit = None
-        for node, dep in users.get(name, []):
-            view, _, representable = per_core_view_scheduled(node, dep, name)
-            if not representable:
-                culprit = f"{node.get_name()} view unrepresentable"
-                break
-            if ref is None:
-                ref = view
-            elif view != ref:
-                culprit = f"{node.get_name()} disagrees: {view} != {ref}"
-                break
-        if culprit is None:
-            continue
-        buf = V.graph.try_get_buffer(name)
-        layout = getattr(buf, "layout", None)
-        allocation = getattr(layout, "allocation", None)
-        if allocation is not None:
-            allocation.pop("lx", None)
-        logger.info("demoted %s out of LX: %s", name, culprit)
+            # The row decision was made by carried_reduction_pinned_row before
+            # placement. Kernel preparation above already proved this
+            # stage can consume the committed physical view. Do not recreate a
+            # symbol correspondence from post-scheduler loop position here.
 
     return nodes
 
@@ -557,29 +613,58 @@ class SuperDSCScheduling(BaseScheduling):
                 restores.append(emit)
         return restores
 
+    def _live_nodes(self, node: BaseSchedulerNode) -> list[BaseSchedulerNode]:
+        """The members of ``node`` that scheduling has not removed."""
+
+        removed = getattr(self.scheduler, "removed_ops", ())
+        return [n for n in node.get_nodes() if n.get_name() not in removed]
+
+    def prepare_kernel(
+        self, node: BaseSchedulerNode, kernel: SpyreKernel
+    ) -> SpyreKernel:
+        """Run the real handlers over one bundle into ``kernel``.
+
+        Each operation is finished as it is constructed. On failure
+        ``kernel.failed_node`` names the operation whose description could not
+        be finalized; the kernel itself is not usable afterwards.
+        """
+        nodes = self._live_nodes(node)
+        # Before any spec is built, which is what this method goes on to do:
+        # create_tensor_arg reads this to decide whether a buffer is kernel-local.
+        # _codegen_into_kernel may reach further inner nodes, so the set can be a
+        # subset -- which errs towards declining.
+        kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
+        with kernel:
+            self._codegen_into_kernel(nodes, kernel)
+        if isinstance(node, CountedLoopSchedulerNode):
+            kernel.wrap_op_specs_in_loop(node.loop_count)
+        kernel.check_op_specs()
+        return kernel
+
     def codegen_node(
         self, node: Union[FusedSchedulerNode, SchedulerNode, CountedLoopSchedulerNode]
     ) -> None:
-        """
-        Generate a kernel given a list of pre-fused nodes.
-        """
-        if isinstance(node, CountedLoopSchedulerNode):
-            self._codegen_counted_loop(node)
-            return
+        """Emit one bundle from its prepared kernel.
 
+        Preparation ran before HBM pooling; only what pooling decided afterwards
+        is bound here: the pool size, the argument list and the HBM addresses.
+        """
         assert self.scheduler
-        nodes = [
-            n
-            for n in node.get_nodes()
-            if n.get_name() not in self.scheduler.removed_ops
-        ]
+        nodes = self._live_nodes(node)
         if len(nodes) == 0:
             return
+        name = node.get_name()
+        leaf_names = {leaf.get_name() for leaf in _all_scheduler_nodes(nodes)}
+        kernel: SpyreKernel | None = getattr(node, "prepared_kernel", None)
+        if kernel is None:
+            if any(_touched_lx_names(leaf) for leaf in _all_scheduler_nodes(nodes)):
+                raise RuntimeError(f"{name} reached codegen without a prepared kernel")
+            kernel = self.prepare_kernel(node, SpyreKernel())
+        elif {leaf.get_name() for leaf in kernel.scheduled_nodes} != leaf_names:
+            raise RuntimeError(f"{name} changed after its kernel was prepared")
+        all_schedule_nodes = kernel.scheduled_nodes
 
-        kernel = SpyreKernel()
-        all_schedule_nodes: list[SchedulerNode] = []
-        with kernel:
-            self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
+        kernel.pool_size = getattr(V.graph, "hbm_pool_sizes", {}).get(name, 0)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -600,88 +685,39 @@ class SuperDSCScheduling(BaseScheduling):
 
         self.free_buffers_in_scheduler()
 
-    def _codegen_counted_loop(self, node: CountedLoopSchedulerNode) -> None:
-        """Generate a kernel for a counted loop group."""
-        assert self.scheduler
-        inner_nodes = [
-            n
-            for n in node.get_nodes()
-            if n.get_name() not in self.scheduler.removed_ops
+    def _codegen_leaf(self, snode: SchedulerNode, kernel: SpyreKernel) -> None:
+        """Run one operation's body through the kernel's handlers."""
+
+        symbols = list(iteration_space(snode))
+        index_vars = [
+            symbols[: len(snode._body.iter_vars)],
+            symbols[len(snode._body.iter_vars) :],
         ]
-        if len(inner_nodes) == 0:
-            return
-
-        kernel = SpyreKernel()
-        all_schedule_nodes: list[SchedulerNode] = []
-        with kernel:
-            self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
-
-        kernel.wrap_op_specs_in_loop(node.loop_count)
-
-        with V.set_kernel_handler(kernel):
-            src_code = kernel.codegen_kernel()
-        kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
-        kernel.kernel_name = kernel_name
-        kernel.code_hash = code_hash(src_code)
-
-        with V.set_kernel_handler(kernel):
-            for snode in all_schedule_nodes:
-                snode.mark_run()
-
-        self.codegen_comment(all_schedule_nodes, kernel_name)
-        kernel.call_kernel(kernel.kernel_name)
-        kernel.emit_layout_restores(self._collect_layout_restores(all_schedule_nodes))
-
-        V.graph.removed_buffers |= kernel.removed_buffers
-        V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
-
-        self.free_buffers_in_scheduler()
+        kernel.scheduled_nodes.append(snode)
+        try:
+            snode.codegen(index_vars)
+        except (Unsupported, ValueError):
+            kernel.failed_node = snode
+            raise
 
     def _codegen_loop_body(
-        self,
-        node: CountedLoopSchedulerNode,
-        kernel: SpyreKernel,
-        all_schedule_nodes: list[SchedulerNode],
-        depth: int = 1,
+        self, node: CountedLoopSchedulerNode, kernel: SpyreKernel
     ) -> None:
         """Codegen the body of a nested CountedLoopSchedulerNode into an existing kernel.
 
         The inner ops are added to the kernel's op_specs list, then wrapped
-        in a LoopSpec for the inner loop count.  Called from
-        _codegen_counted_loop to handle nesting without creating a separate kernel.
+        in a LoopSpec for the inner loop count, so nesting needs no separate
+        kernel.
         """
-        assert self.scheduler
-        inner_nodes = [
-            n
-            for n in node.get_nodes()
-            if n.get_name() not in self.scheduler.removed_ops
-        ]
         body_start = len(kernel.op_specs)
-        for inner in inner_nodes:
-            if isinstance(inner, CountedLoopSchedulerNode):
-                self._codegen_loop_body(inner, kernel, all_schedule_nodes, depth + 1)
-            else:
-                sched = self.generate_node_schedule([inner])
-                all_schedule_nodes.extend(sched)
-                for snode in sched:
-                    var_ranges = iteration_space(snode)
-                    vs = list(var_ranges.keys())
-                    index_vars = [
-                        vs[: len(snode._body.iter_vars)],
-                        vs[len(snode._body.iter_vars) :],
-                    ]
-                    snode.codegen(index_vars)
-
+        self._codegen_into_kernel(self._live_nodes(node), kernel)
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
         kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
 
     def _codegen_into_kernel(
-        self,
-        nodes: list[BaseSchedulerNode],
-        kernel: SpyreKernel,
-        all_schedule_nodes: list[SchedulerNode],
+        self, nodes: list[BaseSchedulerNode], kernel: SpyreKernel
     ) -> None:
         """Codegen a sequence of nodes into an existing kernel in order.
 
@@ -691,18 +727,10 @@ class SuperDSCScheduling(BaseScheduling):
         """
         for node in nodes:
             if isinstance(node, CountedLoopSchedulerNode):
-                self._codegen_loop_body(node, kernel, all_schedule_nodes)
+                self._codegen_loop_body(node, kernel)
             else:
-                sched = self.generate_node_schedule([node])
-                all_schedule_nodes.extend(sched)
-                for snode in sched:
-                    var_ranges = iteration_space(snode)
-                    vs = list(var_ranges.keys())
-                    index_vars = [
-                        vs[: len(snode._body.iter_vars)],
-                        vs[len(snode._body.iter_vars) :],
-                    ]
-                    snode.codegen(index_vars)
+                for snode in self.generate_node_schedule([node]):
+                    self._codegen_leaf(snode, kernel)
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """
@@ -720,7 +748,10 @@ class SuperDSCScheduling(BaseScheduling):
             buf.writeline(f"async_compile.{method}('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
-            buf.writeline(")")
+            if method == "sdsc" and kernel._kernel_uses_hbm_pool():
+                buf.writeline(f", pool_size={kernel.pool_size})")
+            else:
+                buf.writeline(")")
             origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
             metadata_comment = f"{origins}\n{detailed_origins}"
             wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)

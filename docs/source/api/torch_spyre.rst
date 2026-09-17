@@ -277,36 +277,89 @@ A worked example is in :doc:`../user_guide/profiling/index`.
 Profiler
 --------
 
-.. function:: torch_spyre.profiler.is_available() -> bool
+Device presence is ``torch.spyre.is_available()``. Device-side timing uses
+upstream ``torch.profiler`` (see :doc:`../user_guide/profiling/index`).
+``torch_spyre.profiler`` exports FFDC retrieval only:
 
-   Returns ``True`` when the Spyre profiler integration is built into the
-   current package and the device can be profiled. Returns ``False`` in the
-   default build today; the in-tree profiler package is a scaffold whose
-   collection backends are still landing. See
-   :doc:`../user_guide/profiling/index` for the current state and the
-   profiling tooling that is available in the meantime.
+.. function:: torch_spyre.profiler.get_diagnostic_report(output_dir=None) -> dict | None
+
+   Same function as ``torch.spyre.get_diagnostic_report`` below.
 
 FFDC (First Failure Data Capture)
 ---------------------------------
 
 .. function:: torch.spyre.get_diagnostic_report(output_dir=None) -> dict | None
 
-   Return the most recent FFDC diagnostic report, or ``None`` if no reports
-   exist. Reports are written automatically when a failure is captured and
-   ``USE_SPYRE_PROFILER=1`` is set.
+   Return the most recent valid FFDC diagnostic report written by the
+   torch-spyre failure hooks, or ``None`` if no valid report remains.
 
-   Args:
-      output_dir: Directory to search. Defaults to
-         ``~/.cache/torch/inductor/torch-spyre/ffdc_reports`` (respecting
-         ``TORCHINDUCTOR_CACHE_DIR``), with a fallback to the system temp dir.
+   Reports are JSON documents with these top-level sections: capture
+   context (``metadata``), the exception itself (``failure``), environment
+   variables (``environment``), compiler artifact paths (``artifacts``),
+   runtime context (``runtime``), hardware availability
+   (``hardware_state``), and collector completeness (``collector``). The
+   returned dict also includes ``_report_path`` with the absolute path of the
+   loaded report file. That path is local to the host that produced the
+   report (for example a developer machine or CI pod filesystem). It is not
+   published to CI web UIs unless a workflow explicitly prints the report or
+   uploads the report directory as an artifact.
 
-   Example::
+   Reports are written automatically when a failure is captured and
+   ``TORCH_SPYRE_FFDC=1`` is set. Retrieval via this function does not
+   require that environment variable. ``TORCH_SPYRE_FFDC`` is intentionally
+   separate from ``USE_SPYRE_PROFILER`` (the CMake / Kineto profiler build
+   flag).
+
+   Each successful capture writes a new file named
+   ``ffdc_<category>_<YYYYMMDDTHHMMSS>_<microseconds>_<pid>.json``; earlier
+   reports are not overwritten. Categories include ``compile_frontend``,
+   ``compile_backend``, ``runtime_launch``, ``unimplemented``, and
+   ``unknown``. The directory retains the newest 50 files (by modification
+   time) and deletes older ones. Identify a report by that filename
+   (category, UTC timestamp, process id) or by fields inside the JSON such
+   as ``metadata.timestamp``, ``metadata.pid``, ``metadata.host``,
+   ``failure.category``, ``failure.file``, and ``failure.lineno``.
+
+   "Most recent" is the largest UTC timestamp embedded in the filename
+   (``YYYYMMDDTHHMMSS_microseconds``), not ``st_mtime`` and not scoped to
+   the current process. Unreadable or structurally invalid files (for
+   example corrupted JSON, non-UTF-8 content, invalid filenames, a
+   missing string ``failure.category``, FIFOs, or symlinks) are skipped,
+   and ``None`` is returned when no valid report remains. See
+   :ref:`ffdc-selecting-reports` for the full selection rules.
+
+   Capture is gated by ``TORCH_SPYRE_FFDC=1`` at **write** time only.
+   Retrieval does not require that variable, even if it was unset in a
+   later session. The directory **does** have to match: if
+   ``TORCHINDUCTOR_CACHE_DIR`` (or ``TMPDIR``) differs between capture
+   and retrieval, pass the original ``output_dir`` explicitly.
+
+   :param output_dir: Directory to search. If ``None``, uses
+       ``<Inductor cache root>/torch-spyre/ffdc_reports``, where the cache
+       root is ``$TORCHINDUCTOR_CACHE_DIR`` or else
+       ``<tempdir>/torchinductor_<user>`` from Inductor ``cache_dir()``
+       (not ``~/.cache/torch/inductor``). ``<tempdir>`` is
+       ``tempfile.gettempdir()`` — typically ``/tmp`` on Linux, or
+       ``$TMPDIR`` when that is set. Falls back to
+       ``<tempdir>/torch-spyre-ffdc`` if that root cannot be resolved.
+   :type output_dir: str, optional
+
+   .. code-block:: python
 
       import torch
+      import torch_spyre
 
+      # After a Spyre compile / launch / unimplemented failure in this
+      # process (do not wrap arbitrary user code in a bare except):
       report = torch.spyre.get_diagnostic_report()
       if report is not None:
-          print(report["failure"]["category"], report["failure"]["message"])
+          print(report["failure"]["category"])
+          print(report["_report_path"])
+
+   The same function is also available as
+   ``torch_spyre.profiler.get_diagnostic_report``. For usage workflow,
+   report locations, and JSON triage, see
+   :doc:`../user_guide/profiling/ffdc`.
 
 Tensor Operations
 -----------------
@@ -347,17 +400,21 @@ Model Loading Utilities
 -----------------------
 
 The ``torch_spyre.model_utils`` module provides utilities that transfer a
-model to Spyre with optimal weight layout. For ``nn.Linear`` layers, weights
-are stickified along ``out_features`` (using ``dim_order=[1, 0]``) so that
-matrix multiplications can run at full throughput without a host-side
-transpose.
+model to Spyre with an optimal per-weight layout. For ``nn.Linear`` layers,
+weights are stickified along ``out_features`` (using ``dim_order=[1, 0]``) so
+that matrix multiplications can run at full throughput without a host-side
+transpose. For ``nn.Embedding`` layers, tables get a gather-optimal
+"indirect access" layout (vocab dim outermost) because they are read as a
+gather rather than a matmul.
 
 .. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None)
 
    Transfer all parameters and buffers of *model* to Spyre. ``nn.Linear``
-   weights use a dimension-swapped layout (``dim_order=[1, 0]``); all other
-   tensors use the default layout. Idempotent: parameters already on Spyre
-   are skipped.
+   weights use a dimension-swapped layout (``dim_order=[1, 0]``);
+   ``nn.Embedding`` tables use a gather-optimal "indirect access" layout
+   (vocab dim outermost, hidden dim split into sticks); all other tensors
+   use the default layout. Idempotent: parameters already on Spyre are
+   skipped.
 
    :param model: The model to transfer.
    :type model: torch.nn.Module
@@ -576,17 +633,22 @@ Environment Variables
      - Purpose
    * - ``TORCH_SPYRE_DEBUG=1``
      - Build-time: enable C++ debug logging and ``-O0`` builds.
-       Runtime: deprecated, use ``TORCH_LOGS='spyre:DEBUG'`` instead
+       Runtime: deprecated, use ``TORCH_LOGS='+torch_spyre'`` instead
        (see ``torch_spyre.logging_config``)
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
      - Suppress int64 → int32 downcast warnings
+   * - ``TORCH_SPYRE_FFDC=1``
+     - Enable first-failure data capture at write time. Retrieve the report
+       with :func:`torch.spyre.get_diagnostic_report`
+   * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
+     - Size of the host-compute stream pool used by program correction
+       (default ``4``, maximum ``8``)
    * - ``SPYRE_INDUCTOR_LOG=1``
-     - *Deprecated*. Use ``TORCH_LOGS='spyre.inductor:INFO'``. Enables Spyre
-       Inductor logging
+     - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
+       Inductor logging (INFO level)
    * - ``SPYRE_INDUCTOR_LOG_LEVEL=DEBUG``
-     - *Deprecated*. Set the level in ``TORCH_LOGS`` (e.g.
-       ``spyre.inductor:DEBUG``). Sets Spyre Inductor log verbosity (DEBUG,
-       INFO, WARNING, ERROR)
+     - *Deprecated*. Use ``TORCH_LOGS='+torch_spyre.inductor'`` (DEBUG level).
+       Sets Spyre Inductor log verbosity
    * - ``SPYRE_LOG_FILE=path``
      - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
        Redirects Spyre Inductor logs to a file
@@ -612,13 +674,23 @@ Environment Variables
    * - ``LX_PLANNING``
      - Enable LX scratchpad planning (default ``1``; set ``0`` to skip the
        ``scratchpad_planning`` pass)
+   * - ``SPYRE_LX_PLANNER_RELAYOUT``
+     - Enable certified LX-to-LX movement, exact fused-axis views,
+       consumer-compatible producer ordering and same-core restickify
+       residency (default ``1``). Set ``0`` to disable these optional
+       optimizations; ownership and capacity checks remain active. Allocator
+       selection and the LX budget are unchanged. Unsupported ownership or
+       insufficient space still uses HBM.
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
-   * - ``GLOBAL_STICK_OPTIMIZER``
-     - Enable the global stick-dimension optimizer (default ``1``)
+   * - ``FRONTEND_POOL_ALLOCATION``
+     - Allocate each SDSC bundle's HBM pool as a front-end PyTorch tensor
+       passed in as ``%pool_base_addr``, instead of the backend
+       self-allocating via ``sdscbundle.device_mem_allocate``
+       (default ``0``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
      - Permute physical core IDs at SDSC emission so K-collaborator cores
        sit on adjacent ring positions, reducing PSUM chain hops (default
@@ -627,8 +699,8 @@ Environment Variables
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
    * - ``LAYOUT_SOLVER``
-     - LX scratchpad layout solver strategy: ``greedy`` (default),
-       ``bestfit``, ``firstfit``, ``cpsat``, ``simulated_annealing``.
+     - LX scratchpad layout solver strategy: ``cpsat`` (default),
+       ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
    * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
      - Enable reduction tiling in the pre-scheduling pipeline (default
@@ -636,6 +708,16 @@ Environment Variables
    * - ``SPYRE_LOG_PASSES``
      - Comma-separated list of pass names after which to log the
        op-spec IR at pipeline stage boundaries (default empty)
+   * - ``SPYRE_DUMP_COST``
+     - Print the predicted-runtime report after pre-scheduling: one total
+       plus a per-kernel breakdown (default ``0``).
+       See :doc:`/compiler/cost_model`
+   * - ``TORCH_SPYRE_NATIVE_PACKER``
+     - Use the C++ permutation-layout packer accelerator in the
+       simulated-annealing layout solver (default ``1``; set ``0`` to force
+       the pure-Python packer). No effect unless
+       ``LAYOUT_SOLVER=simulated_annealing``.
+       See :doc:`/compiler/simulated_annealing_layout`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``
@@ -649,6 +731,29 @@ Environment Variables
        alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
        ``1`` (disabled/opt-in): set to ``0`` to enable automatic
        span-overflow coarse tiling.
+   * - ``SPYRE_INDUCTOR_SDSC_CACHE``
+     - Cache and reuse ``sdsc.json`` files during codegen when two OpSpecs
+       produce identical SuperDSC content, reducing bundle size for
+       programs with loops (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_VALIDATE_OP_SPECS``
+     - Validate OpSpecs at pipeline stage boundaries to catch invariant
+       violations early (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_CONV2D_DIRECT``
+     - Emit a native conv2d SDSC (``opFuncName="conv2d"`` on the ``pt``
+       unit) instead of the im2col + matmul decomposition. Off by default
+       (``0``); the decomposition remains the default path and the fallback
+       for grouped, transposed, or non-fp16 cases
+   * - ``SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT``
+     - For a strided direct-lowered conv2d, forbid splitting the output
+       spatial dims across cores so each core computes whole spatial rows
+       and columns (default ``1``; set ``0`` to opt out)
+   * - ``TORCH_SPYRE_KTIR``
+     - Opt-in OpSpec-to-KTIR emitter (experimental). When enabled the
+       scheduler emits ``async_compile.ktir(...)`` instead of the SDSC
+       bundle; inert by default (``0``), leaving the SDSC path unchanged
+   * - ``KTIR_DEVICE_MLIR``
+     - Path to a ``.mlir`` file declaring the target device for the KTIR
+       execution path (default empty)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

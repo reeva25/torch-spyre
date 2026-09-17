@@ -6,6 +6,8 @@ Shared class and methods for all OOT PyTorch test overrides.
 
 import os
 import json
+import unittest
+from functools import wraps
 from typing import Dict, List, Optional, Set, Tuple
 import warnings
 
@@ -48,6 +50,7 @@ from oot_framework.oot_upstream_patcher import (
     _OOTCpuMovePatcher,
     _OOTNoGradPatcher,
     _OOTPlatformMarkerPatcher,
+    _OOTTestTypeMarkerPatcher,
 )
 from oot_framework.oot_test_config_models import (
     OOTTestConfig,
@@ -57,6 +60,7 @@ from oot_framework.oot_test_config_models import (
     TestEntry,
 )
 from oot_framework.oot_test_common_methods_invocations import (
+    _make_named_module_info_cls,
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )
@@ -143,6 +147,10 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
     GLOBAL_DTYPE_FORCE_XFAIL: Set[torch.dtype] = set()
 
+    # test_suite_config.labels from the YAML, e.g. ["unit", "regression", "trunk"].
+    # Drives the testtype__<label> pytest markers (see _OOTTestTypeMarkerPatcher).
+    TEST_SUITE_LABELS: List[str] = []
+
     # File-level module filtering (populated during config load)
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
     _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
@@ -222,6 +230,18 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
         file_entry: FileEntry = resolve_current_file(config, path)
 
+        # Prefer file_entry.labels: for a multi-config directory run,
+        # merge_yaml_configs() threads each source config's own
+        # test_suite_config.labels onto its file entries (the merged
+        # document has no single top-level labels field that could
+        # represent per-file provenance once files from different configs
+        # are combined). Empty there means a single-config run (the source
+        # YAML never sets per-file labels), so fall back to the top-level
+        # field, which correctly applies to every file in that one config.
+        cls.TEST_SUITE_LABELS = list(
+            file_entry.labels or config.test_suite_config.labels
+        )
+
         # Build the exact-name lookup map and the regex-pattern list.
         # Regex patterns (names containing regex metacharacters) go into
         # REGEX_ENTRIES; everything else goes into TEST_ENTRIES keyed by
@@ -264,6 +284,11 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 f"not available: {e}"
             )
             return
+
+        # The YAML's `name` has to win over the class-derived one so several
+        # entries for the same class (one per layer, per phase, ...) each get a
+        # distinct test name instead of colliding.
+        named_module_info_cls = _make_named_module_info_cls(ModuleInfo)
 
         # Get existing module names to avoid duplicates
         existing_names = {m.name for m in module_db}
@@ -322,13 +347,21 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                     if resolved_dtypes
                     else (torch.float32, torch.float16, torch.bfloat16)
                 )
-                module_info = ModuleInfo(
+                module_info = named_module_info_cls(
                     module_cls,
                     module_inputs_func=create_module_inputs_func_from_yaml(module_item),
                     skips=(),
                     decorators=None,
                     dtypes=dtypes,
+                    oot_name=module_name,
                 )
+                # ModuleInfo has no field for this, and upstream never looks at
+                # it; attach it so device-specific tests can read the YAML's
+                # intent off the same object @modules hands them (they receive
+                # module_info, never the YAML item). Read with
+                # getattr(module_info, "apply_device_layout", False) so a
+                # ModuleInfo from any other source stays valid.
+                module_info.apply_device_layout = module_item.apply_device_layout
                 module_db.append(module_info)
                 existing_names.add(module_name)
             except Exception as e:
@@ -418,14 +451,17 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
         # per-test label filter — skip if this entry's labels don't include the
         # active TEST_TYPE.  Empty labels means "no restriction; run whenever the
-        # suite runs" so the check is a no-op for unlabelled entries.
+        # suite runs" so the check is a no-op for unlabelled entries. There is no
+        # catch-all TEST_TYPE value that bypasses an entry's explicit labels
+        # (matching filter_configs.py's file-level matching) -- only an unset
+        # TEST_TYPE (e.g. running pytest directly, outside make/CI) skips
+        # filtering entirely.
         # suite_<group> values are structural (handled by filter_configs.py at the
         # config-file level) and are ignored here.
         if entry is not None and entry.labels:
-            test_type = os.environ.get(ENV_TEST_TYPE, "full")
+            test_type = os.environ.get(ENV_TEST_TYPE, "")
             if (
                 test_type
-                and test_type != "full"
                 and not test_type.startswith("suite_")
                 and test_type not in entry.labels
             ):
@@ -695,6 +731,10 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         # Attaches platform__<arch> marker
         _OOTPlatformMarkerPatcher(test).patch()
 
+        # Attaches testtype__<label> marker(s) from this config's
+        # test_suite_config.labels
+        _OOTTestTypeMarkerPatcher(test, cls.TEST_SUITE_LABELS).patch()
+
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)
         new_methods = set(cls.__dict__.keys()) - existing_methods
@@ -755,8 +795,26 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 # SKIPPED lines per test.
                 #
                 # Deleting the method entirely removes it from the class so
-                # pytest never collects it
-                delattr(cls, method_name)
+                # pytest never collects it -- EXCEPT when method_name is
+                # identical to the untouched, undecorated method still sitting
+                # on generic_cls's own __dict__ (true for any test with no
+                # dtype/device suffix, e.g. a plain method with no @dtypes/
+                # @ops parametrization). `cls` is built as
+                # type(class_name, (base, generic_cls), {}), so delattr only
+                # removes cls's own override and unmasks the inherited
+                # original, which then runs unfiltered (see issue: YAML
+                # mode:skip silently ignored, tests reaching hardcoded
+                # GPU_TYPE/cuda calls). Fall back to a skip stub in that case.
+                if generic_cls is not None and method_name in generic_cls.__dict__:
+                    _skip_reason = reason or "Skipped by OOT config"
+
+                    @wraps(test)
+                    def _skip(self, _reason=_skip_reason):
+                        raise unittest.SkipTest(_reason)
+
+                    setattr(cls, method_name, _skip)
+                else:
+                    delattr(cls, method_name)
                 continue
 
             # Following lines has been commented out to disable generating

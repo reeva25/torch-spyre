@@ -17,13 +17,36 @@ from functools import wraps
 
 import torch
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    MutationLayoutSHOULDREMOVE,
+    TensorBox,
+)
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
+from .constants import DEVICE_NAME
+
 
 @contextmanager
 def spyre_data_types():
+    """Keep elementwise computation at the input width for the whole compile.
+
+    Upstream ``_computation_dtype_map`` sends fp16 / bf16 / complex32 to a wider
+    computation dtype, so aten refs upcast to fp32 before computing.  Spyre
+    lowers these widths natively and does not want that implicit upcast, so the
+    map is replaced with identity entries for the duration of the compile:
+    inside this CM ``get_computation_dtype(torch.float16)`` is fp16, not fp32.
+
+    Action at a distance worth knowing before you touch this: a decomposition
+    that genuinely needs a wider evaluation width can no longer get it from
+    ``elementwise_dtypes(...)[0]`` here, and must spell it with an explicit
+    ``.to(...)``.  ``_taylor_dtypes`` in ``decompositions.py`` (cos / sin) does
+    exactly that and documents why -- its Cody-Waite range reduction resolves
+    the argument against pi and loses ~0.75 absolute at a 10-bit mantissa.
+    """
     saved = torch._prims_common._computation_dtype_map
     torch._prims_common._computation_dtype_map = {
         torch.bfloat16: torch.bfloat16,
@@ -34,6 +57,46 @@ def spyre_data_types():
         yield
     finally:
         torch._prims_common._computation_dtype_map = saved
+
+
+@contextmanager
+def _preserve_spyre_input_storage_offsets():
+    """Attach graph-input offsets before lowering creates dependent views.
+
+    Upstream ``GraphLowering.placeholder`` records ``storage_offset`` beside
+    the graph input, but initializes the input's ``FixedLayout`` with offset
+    zero.  Spyre repairs that layout during pre-scheduling layout propagation;
+    by then, however, a view lowered from the input has already copied the
+    zero offset into its own ``FixedLayout``.  Put the recorded offset on the
+    input immediately so every subsequently constructed view inherits it.
+    """
+    old_placeholder = GraphLowering.placeholder
+
+    def _spyre_placeholder(self: GraphLowering, target, args, kwargs):
+        result = old_placeholder(self, target, args, kwargs)
+        if not isinstance(result, TensorBox):
+            return result
+
+        input_buffer = result.data.data
+        layout = input_buffer.layout
+        if not isinstance(layout, FixedLayout) or layout.device.type != DEVICE_NAME:
+            return result
+
+        name = self.graph_input_names[-1]
+        input_buffer.layout = FixedLayout(
+            layout.device,
+            layout.dtype,
+            layout.size,
+            layout.stride,
+            self.graph_input_storage_offsets[name],
+        )
+        return result
+
+    GraphLowering.placeholder = _spyre_placeholder  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        GraphLowering.placeholder = old_placeholder  # type: ignore[method-assign]
 
 
 @contextmanager
@@ -74,6 +137,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
     )
+    from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     # *) Inductor config tweaks (saved/restored)
     new_config = {
@@ -90,6 +154,10 @@ def enable_spyre_context(example_inputs: list[InputType]):
         # Disable fusing of mm + permute/transpose for now.
         "permute_fusion": False,
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
+        "reorder_for_locality": False,  # Prevents unhinted ops from being moved into hinted regions.
+        # Spyre has no device-side RNG: replace_random would rewrite aten RNG ops
+        # into prims.inductor_random, whose index_expr lowering Spyre cannot codegen.
+        "fallback_random": True,
     }
 
     from torch._inductor.ir import Loops
@@ -104,14 +172,25 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
 
-    # Inject the pre_scheduling_passes before the Scheduler is constructed,
-    # allowing the passes to modify the graph IR (buffers, inputs, constants).
     old_update_scheduler = GraphLowering._update_scheduler
 
     _pre_scheduling_pass = CustomPreSchedulingPasses()
 
     def _spyre_update_scheduler(self: GraphLowering) -> None:
-        _pre_scheduling_pass(self)
+        # Nested compiler contexts may wrap this hook more than once. The
+        # graph-mutating pre-scheduling pipeline runs once per GraphLowering.
+        if not getattr(self, "_spyre_pre_scheduling_complete", False):
+            # recover_spyre_hints runs here (after all post-grad FX passes including
+            # decompose_auto_functionalized) rather than in CustomPostPasses.
+            # decompose_auto_functionalized replaces auto_functionalized_v2 nodes
+            # via make_fx retracing, which creates new FX nodes whose meta["custom"]
+            # only contains hints from the innermost scope. Running recovery here
+            # ensures the final FX graph (post-decomposition) gets the full hint set.
+            gm = self.graph.owning_module
+            if gm is not None and "__spyre_dim_hints" in gm.meta:
+                recover_spyre_hints(self.graph)
+            _pre_scheduling_pass(self)
+            setattr(self, "_spyre_pre_scheduling_complete", True)
         old_update_scheduler(self)
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
@@ -133,26 +212,21 @@ def enable_spyre_context(example_inputs: list[InputType]):
     def _spyre_scheduler_node_has_side_effects(self: SchedulerNode) -> bool:
         if getattr(self.node, "_coarse_tile_force_live", False):
             return True
+        # ComputedBuffers with MutationLayoutSHOULDREMOVE write into a
+        # pre-existing buffer (e.g. copy_forced dst). The scheduler's own DCE
+        # doesn't know about this layout convention and marks them dead when
+        # no downstream op reads the output name. Keep them live.
+        if isinstance(self.node, ComputedBuffer) and isinstance(
+            self.node.layout, MutationLayoutSHOULDREMOVE
+        ):
+            return True
         return old_scheduler_node_has_side_effects(self)
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
-    # Prevent remove_noop_ops from eliminating aten.copy, aten.clone, and
-    # aten.alias nodes.  That pass treats them as no-ops and replaces them
-    # with their input, discarding the op before it reaches lowering.
-    # aten.copy.out normalizes to aten.copy.default before remove_noop_ops
-    # runs, so popping copy.default covers both copy overloads.
-    # aten.alias is a bookkeeping view node with no data movement; we preserve
-    # it defensively so downstream passes see the full graph.
-    from torch._inductor.fx_passes.post_grad import noop_registry
-
-    _saved_copy_noop = noop_registry.pop(torch.ops.aten.copy.default, None)
-    _saved_clone_noop = noop_registry.pop(torch.ops.aten.clone.default, None)
-    _saved_clone_out_noop = noop_registry.pop(torch.ops.aten.clone.out, None)
-    _saved_alias_noop = noop_registry.pop(torch.ops.aten.alias.default, None)
-
     with (
         spyre_data_types(),
+        _preserve_spyre_input_storage_offsets(),
         enable_spyre_lowerings(),
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
@@ -165,14 +239,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
-            if _saved_copy_noop is not None:
-                noop_registry[torch.ops.aten.copy.default] = _saved_copy_noop
-            if _saved_clone_noop is not None:
-                noop_registry[torch.ops.aten.clone.default] = _saved_clone_noop
-            if _saved_clone_out_noop is not None:
-                noop_registry[torch.ops.aten.clone.out] = _saved_clone_out_noop
-            if _saved_alias_noop is not None:
-                noop_registry[torch.ops.aten.alias.default] = _saved_alias_noop
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"

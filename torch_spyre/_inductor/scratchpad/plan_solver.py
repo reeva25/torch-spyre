@@ -15,11 +15,22 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
+import itertools
 import math
+import sympy
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+
 from enum import Enum
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.pass_utils import PerCoreView
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        ChosenRelayout,
+        LXRelayoutPlan,
+        RelayoutCandidate,
+    )
 
 logger = get_inductor_logger("scratchpad.plan_solver")
 
@@ -60,7 +71,7 @@ class LifetimeBoundBuffer:
     is what makes ``read_count`` trustworthy: one entry per accessing op means
     that for a computed buffer ``read_count == 0`` is exactly "written, never
     read", which the in-place invariants rely on (see
-    :func:`assert_in_place_parent_is_read`).  A repeated index would describe a
+    :func:`check_in_place_parent_is_read`).  A repeated index would describe a
     buffer written and read by the same op, i.e. with a single live tick, and
     would let such a buffer pass as an in-place parent.
 
@@ -77,6 +88,22 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
+    # Optional exclusive lifetime end for storage reused by a counted loop.
+    # Keep this separate from ``uses``: it changes address overlap, but must not
+    # manufacture a read or inflate residency/spill benefit.
+    lifetime_end_override: Optional[int] = None
+    # Buffers that must be placed atomically with this one. Despite the name,
+    # this is one-to-many: only the group root carries the complete partner list.
+    paired_with: list["LifetimeBoundBuffer"] = field(
+        default_factory=list, repr=False, compare=False
+    )
+    # LX relayout plans for which this buffer is the source.
+    lx_relayout_plans: list["LXRelayoutPlan"] = field(
+        default_factory=list, repr=False, compare=False
+    )
+    # The physical per-core ownership accepted by the residency judge. Placement
+    # writes this beside the LX address; it must never derive another view.
+    lx_view: Optional["PerCoreView"] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Not also asserted non-empty: buffers are sometimes registered before
@@ -92,6 +119,12 @@ class LifetimeBoundBuffer:
             f"buffer {self.name} has uses={self.uses}, which is not strictly "
             "increasing; uses carries one distinct index per accessing operation"
         )
+        if self.lifetime_end_override is not None and self.uses:
+            assert self.lifetime_end_override >= self.uses[-1] + 1, (
+                f"buffer {self.name} has lifetime_end_override="
+                f"{self.lifetime_end_override} before nominal exclusive end "
+                f"{self.uses[-1] + 1}"
+            )
 
     @property
     def read_count(self) -> int:
@@ -114,7 +147,8 @@ class LifetimeBoundBuffer:
 
     @property
     def end_time(self) -> int:
-        return self.uses[-1] + 1
+        nominal = self.uses[-1] + 1
+        return max(nominal, self.lifetime_end_override or nominal)
 
     @property
     def min_footprint(self) -> int:
@@ -125,47 +159,122 @@ class LifetimeBoundBuffer:
         """Returns true iff self and other overlap in time."""
         return self.start_time < other.end_time and other.start_time < self.end_time
 
+    @property
+    def sym_is_lx(self) -> sympy.Symbol:
+        return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
+
+
+@dataclass(frozen=True)
+class TileAxis:
+    """One coarse-tiling level.
+
+    ``host_dim`` is a *positional* index: into ``op_out_coords(op)`` for an
+    output axis, or into the op's ordered reduction loop variables (see
+    :func:`wsr.coarse_tile.reduction_loop_vars`) for a reduction axis.
+    ``is_reduction`` selects which frame ``host_dim`` indexes. ``count`` is the
+    split factor -- how many equal tiles the axis is cut into.
+    """
+
+    host_dim: int
+    count: int
+    is_reduction: bool = False
+
+
+@dataclass(frozen=True)
+class TileSpec:
+    """An ordered, outermost-first tuple of :class:`TileAxis` levels.
+
+    Ordered -- where the core-division splits are dicts and so order-free --
+    because tile levels *nest*: swapping two levels is a different plan. Frozen
+    and hashable so ``==`` is exactly the "same tiling shape" test the group
+    derivation keys on. The empty spec is *untiled*, and is the inert default
+    every :class:`CoreDivision` carries while ``auto_coarse_tiling`` is off.
+    """
+
+    axes: tuple[TileAxis, ...] = ()
+
+    @property
+    def is_untiled(self) -> bool:
+        return not self.axes
+
+    @property
+    def depth(self) -> int:
+        """Number of nested tile levels."""
+        return len(self.axes)
+
+    @property
+    def tile_count(self) -> int:
+        """Total number of loop tiles across every level (all axes)."""
+        return math.prod(a.count for a in self.axes)
+
+    @property
+    def output_tile_count(self) -> int:
+        """Product of the split factors over output (non-reduction) axes only.
+
+        This is the factor by which a tiled op's own per-tile scratch shrinks,
+        and so the factor :attr:`CoreDivisionBuffer.min_footprint` divides by. A
+        reduction-tiled level does *not* shrink that buffer -- the op's own
+        output is the accumulator, which keeps the full output extent -- so
+        reduction axes are excluded here even though they count in
+        :attr:`tile_count`.
+        """
+        return math.prod(a.count for a in self.axes if not a.is_reduction)
+
+    @property
+    def label(self) -> str:
+        if not self.axes:
+            return "untiled"
+        return "/".join(
+            f"{'~' if a.is_reduction else ''}d{a.host_dim}:{a.count}" for a in self.axes
+        )
+
 
 @dataclass
 class CoreDivision:
     """One permissible core-division of a buffer's producing op.
 
-    ``output_splits`` / ``reduction_splits`` are the stride/coeff-keyed encoding
-    produced by :func:`pass_utils.splits_by_index_coeff` -- exactly the shape
-    stored in ``op.op_it_space_splits``. Solvers are expected to use these to size
-    the buffer (per-core footprint = total / ``output_partition``).
+    ``splits`` is keyed by the producer's iteration symbols -- one entry per
+    axis with a split factor.
+    ``reduction_syms`` names the subset of those keys that split a reduction
+    axis rather than an output axis.
+    ``tiling`` pairs a coarse tiling onto this division as one candidate. The
+    empty :class:`TileSpec` is untiled and inert.
     """
 
-    output_splits: dict[int, int] = field(default_factory=dict)
-    reduction_splits: dict[int, int] = field(default_factory=dict)
+    splits: dict[sympy.Symbol, int] = field(default_factory=dict)
+    reduction_syms: frozenset[sympy.Symbol] = field(default_factory=frozenset)
+    tiling: TileSpec = field(default_factory=TileSpec)
 
     @property
     def cores_used(self) -> int:
-        return math.prod(self.output_splits.values()) * math.prod(
-            self.reduction_splits.values()
-        )
+        return math.prod(self.splits.values())
 
     @property
-    def is_clean(self) -> bool:
-        """True when no reduction axis is split, so the output is fully sliced
-        across cores (no per-core partial sums)."""
-        return not self.reduction_splits
+    def output_splits(self) -> dict[sympy.Symbol, int]:
+        return {s: v for s, v in self.splits.items() if s not in self.reduction_syms}
+
+    @property
+    def reduction_splits(self) -> dict[sympy.Symbol, int]:
+        return {s: v for s, v in self.splits.items() if s in self.reduction_syms}
 
     @property
     def output_partition(self) -> int:
         """How many cores the output buffer is sliced across."""
         return math.prod(self.output_splits.values())
 
-    def signature_key(self):
-        """Per-core slicing signature, or ``None`` for a reduction-split division
-        (a ``None`` never compares equal, so partial-reduction divisions never
-        match)."""
-        return tuple(sorted(self.output_splits.items())) if self.is_clean else None
-
     @property
     def label(self) -> str:
-        out = ",".join(f"s{s}/{f}" for s, f in sorted(self.output_splits.items()))
-        red = ",".join(f"~s{s}/{f}" for s, f in sorted(self.reduction_splits.items()))
+        """Human-readable rendering of this division's splits, e.g.
+        ``"s0/4 ~s1/2"`` (output split by 4 on symbol 0, reduction split by 2
+        on symbol 1), or ``"whole"`` for the untouched, undivided candidate."""
+        out = ",".join(
+            f"s{s}/{f}"
+            for s, f in sorted(self.output_splits.items(), key=lambda i: str(i[0]))
+        )
+        red = ",".join(
+            f"~s{s}/{f}"
+            for s, f in sorted(self.reduction_splits.items(), key=lambda i: str(i[0]))
+        )
         return " ".join(p for p in (out, red) if p) or "whole"
 
 
@@ -187,25 +296,248 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # an absent/empty entry means no compatible division, so the gate forbids
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    # parent_buf_name -> priced ``RelayoutCandidate`` records for the division
+    # pairs where the parent could stay LX-resident by RELAYING OUT to this
+    # consumer's slicing: the two views differ but are relayout-compatible (a
+    # permutation), priced by the fitted relayout law. Sibling of
+    # ``cd_parent_matches`` (which holds the free, equal-view pairs); populated
+    # only when ``lx_relayout.lx_solver_relayout()`` holds, for the CP-SAT solver's
+    # relayout decision variables. The record carries the views, core count,
+    # group and price, so the solver and the commit path never re-derive them.
+    cd_parent_relayouts: dict[str, list["RelayoutCandidate"]] = field(
+        default_factory=dict
+    )
     chosen_division: Optional[int] = None
+    # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
+    # fired candidate with the destination address (bytes) of the group's copy
+    # (:class:`RelayoutCopyBuffer`). Written back by the solver when this
+    # consumer reads the parent through a resident copy. Every consumer served
+    # by one copy carries the same address; the commit path materializes one
+    # plan per fired group (``FiredRelayoutGroup.from_chosen``).
+    chosen_relayouts: dict[str, "ChosenRelayout"] = field(default_factory=dict)
     boundary: BufferType = BufferType.Intermediate
 
     @property
     def min_footprint(self) -> int:
         """Smallest per-core footprint any candidate division allows. With no
         candidates there is nothing to divide by, so it falls back to ``size``
-        (the placement-only case ``_wrap`` also dispatches on)."""
+        (the placement-only case ``_wrap`` also dispatches on).
+
+        A tiled candidate's own buffer is per-tile scratch, so its footprint
+        shrinks by the output tile count as well as the core count -- this is
+        the LX-residency win entering the footprint math. Reduction tile levels
+        are excluded (see :attr:`TileSpec.output_tile_count`); with
+        ``auto_coarse_tiling`` off every ``cd.tiling`` is empty and this reduces
+        to the previous ``ceil_div(size, output_partition)`` exactly."""
         if not self.core_divisions:
             return self.size
         return min(
-            ceil_div(self.size, cd.output_partition) for cd in self.core_divisions
+            ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
+            for cd in self.core_divisions
+        )
+
+    @property
+    def sym_cores(self) -> sympy.Symbol:
+        return math.prod(self.sym_core_divs.values())
+
+    @property
+    def sym_division(self) -> sympy.Symbol:
+        """The chosen index into ``core_divisions`` as an objective unknown.
+
+        The per-axis split symbols (:attr:`sym_core_divs`) carry the division's
+        *shape* into the cost model; this carries its *identity*, for terms that
+        are tables over candidates rather than functions of the splits - the
+        relayout price (:meth:`RelayoutCopyBuffer.cost_term`) is one. Engines
+        bind it to their division variable (CP-SAT) or to the chosen index (the
+        annealer's ``chosen``)."""
+        return division_symbol(self.name)
+
+    @property
+    def sym_core_divs(self) -> dict[sympy.Symbol, sympy.Symbol]:
+        """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
+        stride coefficient seen across this buffer's candidate divisions, so the
+        cost model can carry an undecided split as an unknown rather than a
+        concrete value."""
+        core_divs = self.core_divisions
+
+        def unique(args):
+            d = {arg: None for arg in args}
+            return list(d)
+
+        keys = unique(itertools.chain.from_iterable(cd.splits for cd in core_divs))
+
+        return {
+            key: sympy.Symbol(f"split_{self.name}_{key}", integer=True, positive=True)
+            for key in keys
+        }
+
+
+def division_symbol(buffer_name: str) -> sympy.Symbol:
+    """The objective symbol for ``buffer_name``'s chosen division index (see
+    :attr:`CoreDivisionBuffer.sym_division`). One constructor so a term built
+    from a buffer's *name* (a relayout copy pricing its source) and the
+    engine's binding built from the buffer agree on name and assumptions."""
+    return sympy.Symbol(f"division_{buffer_name}", integer=True, nonnegative=True)
+
+
+RELAYOUT_COPY_PREFIX = "__spyre_lx_relayout__:copy:"
+
+
+def relayout_copy_name(parent: str, group: int) -> str:
+    """Name of the copy buffer for relayout group ``group`` of ``parent``.
+
+    Shares the ``__spyre_lx_relayout__:`` prefix of the materialized
+    destination buffers so every synthetic-name gate in the allocator (nothing
+    to push, nothing to commit) applies, and differs from them so a copy can
+    never be mistaken for the buffer ``materialize_lx_relayouts`` creates."""
+    return f"{RELAYOUT_COPY_PREFIX}{parent}:g{group}"
+
+
+@dataclass
+class RelayoutCopyBuffer(CoreDivisionBuffer):
+    """The LX destination of one relayout group, as a buffer the solver places.
+
+    A group is one (source buffer, destination per-core view) pair, however many
+    consumers read it. Modelling its destination as an ordinary buffer is what
+    keeps the relayout decision solver-agnostic:
+
+    * **The decision is residency.** ``sym_is_lx`` of this buffer means "the
+      shuffle fires", so any engine that decides residency can decide relayouts.
+    * **Placement comes free.** The copy occupies real LX from the group's first
+      consumer to its last inside whatever no-overlap or packing the engine
+      already runs, so capacity vetoes it like any other buffer. One copy serves
+      every consumer of the group: the model never re-shuffles a view it
+      released, it spills the source instead.
+    * **The price is a plain objective term.** :meth:`cost_term` charges the
+      shuffle, priced by the SOURCE's chosen division, through the shared sympy
+      objective, so every engine charges it the same way and none needs a
+      private cost binding.
+
+    What an engine must add itself is the coupling this buffer cannot express as
+    data: a resident copy needs its source resident under a priced division, a
+    consumer reads the copy only under a division pair its candidates list, and
+    a resident copy must serve at least one consumer (``CpSatLayoutSolver``
+    carries the CP-SAT encoding; the annealer does not decide relayouts yet and
+    is never handed a copy, see ``CoOptimizingAllocator``).
+
+    ``size`` is the destination's per-core span (the candidates'
+    ``destination_footprint_bytes``, the bound the committed path reserves for
+    a relayout destination) times the DESTINATION's core count, and
+    ``core_divisions`` holds one division sliced that many ways, so the
+    per-core footprint every engine derives (``size / output_partition``) is
+    exactly that span. For a broadcast the copy therefore lives on the
+    consumer's cores while its source stays on fewer. ``parents`` is
+    deliberately empty: the source edge is a relayout coupling, not a
+    slicing-match edge, and listing it would make engines that gate residency on
+    ``cd_parent_matches`` refuse the source outright.
+    """
+
+    relayout_parent: str = ""
+    group: int = -1
+    # Every priced (source division, consumer division) pair landing on this
+    # group's destination view, across all its consumers.
+    candidates: tuple["RelayoutCandidate", ...] = ()
+
+    @property
+    def num_cores(self) -> int:
+        return self.core_divisions[0].output_partition
+
+    @property
+    def group_key(self) -> tuple[str, int]:
+        return self.relayout_parent, self.group
+
+    @property
+    def consumers(self) -> tuple[str, ...]:
+        return tuple(sorted({c.consumer for c in self.candidates}))
+
+    def candidates_for(self, consumer: str) -> list["RelayoutCandidate"]:
+        return [c for c in self.candidates if c.consumer == consumer]
+
+    @property
+    def cost_by_source_division(self) -> dict[int, float]:
+        """Shuffle price per source division. The destination view is fixed by
+        the group and the source view by the division, so every candidate with
+        the same source division prices identically; a disagreement means the
+        enumeration and the interning disagree, which is asserted, not
+        averaged."""
+        prices: dict[int, float] = {}
+        for c in self.candidates:
+            known = prices.setdefault(c.source_division, c.cost_ns)
+            assert abs(known - c.cost_ns) <= 1e-6 * max(1.0, abs(c.cost_ns)), (
+                f"relayout group {self.relayout_parent}/g{self.group}: candidates "
+                f"disagree on the price for source division {c.source_division}: "
+                f"{known} vs {c.cost_ns}"
+            )
+        return prices
+
+    def cost_term(self) -> sympy.Expr:
+        """The group's objective contribution: the fitted shuffle price of the
+        source's chosen division, charged once, only while the copy is resident.
+
+        ``is_lx_copy * sum_i price_i * KroneckerDelta(division_source, i)`` -
+        every factor is a symbol an engine already binds (:attr:`sym_is_lx`,
+        :attr:`sym_division`), so it lowers wherever the rest of the objective
+        does: CP-SAT reifies the delta to a literal, ``lambdify`` evaluates it.
+        Deltas rather than ``Eq``: sympy forbids arithmetic on relationals.
+        """
+        source = division_symbol(self.relayout_parent)
+        return self.sym_is_lx * sum(
+            price * sympy.KroneckerDelta(source, i)
+            for i, price in sorted(self.cost_by_source_division.items())
         )
 
 
-def assert_in_place_parent_is_read(
+def build_relayout_copy(
+    parent: CoreDivisionBuffer,
+    group: int,
+    candidates: Sequence["RelayoutCandidate"],
+    consumer_ticks: dict[str, int],
+) -> RelayoutCopyBuffer:
+    """The copy buffer for one relayout group, live from the group's first
+    consumer tick to its last. ``consumer_ticks`` maps each consumer to the
+    schedule position at which it reads (its own ``start_time``); the shuffle
+    that fills the copy is scheduled directly before the first of them."""
+    ordered = tuple(
+        sorted(
+            candidates,
+            key=lambda c: (c.consumer, c.source_division, c.consumer_division),
+        )
+    )
+    assert ordered, f"relayout group {parent.name}/g{group} has no candidates"
+    # The copy is the destination: its geometry is the destination view's span on
+    # the destination's cores. Candidates on one destination view may come from
+    # source divisions on DIFFERENT core counts (a producer's menu spans 1..32
+    # cores; every one of them may broadcast to a 32-core matmul consumer), each
+    # priced by its own source division, so only the destination count must agree.
+    cores = {c.destination_num_cores for c in ordered}
+    assert len(cores) == 1, (
+        f"relayout group {parent.name}/g{group} mixes destination core counts "
+        f"{sorted(cores)}"
+    )
+    assert all(c.parent == parent.name and c.group == group for c in ordered)
+    # One destination view per group, hence one span; the candidates were
+    # measured against the same layout, so a disagreement is an enumeration
+    # error, not something to take the max of.
+    spans = {c.destination_footprint_bytes for c in ordered}
+    assert len(spans) == 1, (
+        f"relayout group {parent.name}/g{group} mixes destination spans {sorted(spans)}"
+    )
+    num_cores = cores.pop()
+    return RelayoutCopyBuffer(
+        name=relayout_copy_name(parent.name, group),
+        size=spans.pop() * num_cores,
+        uses=sorted({consumer_ticks[c.consumer] for c in ordered}),
+        core_divisions=[CoreDivision(splits={"relayout_copy": num_cores})],
+        relayout_parent=parent.name,
+        group=group,
+        candidates=ordered,
+    )
+
+
+def check_in_place_parent_is_read(
     parent: "LifetimeBoundBuffer", child_name: str
 ) -> None:
-    """Assert an in-place parent's storage is read before it is handed over.
+    """Reject an in-place parent whose storage is never read before handover.
 
     The child takes the parent's storage over at the parent's last use, so that
     use has to be a read. For a computed buffer the first use is the write, so a
@@ -214,39 +546,45 @@ def assert_in_place_parent_is_read(
     and child come alive on the same tick while sharing storage. Graph inputs are
     exempt: all their uses are reads, so one use is enough.
 
-    Split out of :func:`_assert_in_place_relationships` because the
-    permutation-based layout solvers enforce this one invariant on its own. For
-    them the other two are placement-time gates rather than preconditions: a
-    child that outgrows its parent, or a pair whose lifetimes do not abut, is
-    simply not placed in-place (see ``_can_inplace``), so asserting either here
-    would reject inputs those solvers handle correctly.
+    Split out of :func:`_check_in_place_relationships` because the
+    permutation-based layout solvers call it directly, where they resolve
+    declared pairs (``_compute_inplace_partners``), alongside their own copy of
+    the abutment check -- their incremental machinery samples the contact
+    profiles at the single tick the pair overlaps and so cannot re-derive a
+    longer overlap. The size invariant is the one they do *not* take as a
+    precondition: an oversized child is simply not placed in-place (see
+    ``_can_inplace``), so checking it here would reject inputs they handle
+    correctly.
     """
     # Tested as "a use strictly after the first" rather than via ``read_count``:
     # the two agree whenever ``uses`` is strictly increasing, but ``uses`` is
     # validated at construction and can be mutated afterwards, and this way a
     # repeated index cannot pass as a read.
     has_read_after_write = len(parent.uses) > 1 and parent.uses[-1] > parent.uses[0]
-    assert parent.first_use_is_read or has_read_after_write, (
-        f"In-place parent {parent.name} is a computed buffer that is never read "
-        f"(uses={parent.uses}), so it cannot hand its storage to child "
-        f"{child_name}"
-    )
+    if not (parent.first_use_is_read or has_read_after_write):
+        raise ValueError(
+            f"In-place parent {parent.name} is a computed buffer that is never "
+            f"read (uses={parent.uses}), so it cannot hand its storage to child "
+            f"{child_name}"
+        )
 
 
-def _assert_in_place_relationships(
+def _check_in_place_relationships(
     buffers: Sequence["LifetimeBoundBuffer"],
 ) -> None:
-    """Assert that all declared in-place parent/child pairs satisfy required invariants."""
+    """Reject any declared in-place pair that violates a required invariant."""
     buf_by_name = {b.name: b for b in buffers}
     for child in buffers:
         for parent_name in child.in_place_parents:
             parent = buf_by_name.get(parent_name)
             if parent:
-                assert parent.end_time == child.start_time + 1, (
-                    f"In-place parent {parent_name}.end_time={parent.end_time} must equal "
-                    f"child {child.name}.start_time+1={child.start_time + 1}"
-                )
-                assert_in_place_parent_is_read(parent, child.name)
+                if parent.end_time != child.start_time + 1:
+                    raise ValueError(
+                        f"In-place parent {parent_name}.end_time={parent.end_time} "
+                        f"must equal child {child.name}.start_time+1="
+                        f"{child.start_time + 1}"
+                    )
+                check_in_place_parent_is_read(parent, child.name)
                 # With core_divisions ``size`` is the *total* footprint, so a static
                 # size check doesn't apply; the per-core match is enforced against the
                 # chosen division in ``CpSatLayoutSolver._add_inplace_relaxation``. Only
@@ -256,10 +594,11 @@ def _assert_in_place_relationships(
                     getattr(parent, "core_divisions", None)
                     or getattr(child, "core_divisions", None)
                 ):
-                    assert child.size <= parent.size, (
-                        f"In-place child {child.name}.size={child.size} "
-                        f"must be <= parent {parent_name}.size={parent.size}"
-                    )
+                    if child.size > parent.size:
+                        raise ValueError(
+                            f"In-place child {child.name}.size={child.size} "
+                            f"must be <= parent {parent_name}.size={parent.size}"
+                        )
 
 
 class MemoryPlanSolver(ABC):
@@ -270,6 +609,8 @@ class MemoryPlanSolver(ABC):
     footprint to pack. :class:`CoreDivisionLayoutSolver` extends the contract for
     solvers that can also choose the division.
     """
+
+    supports_paired_buffers = False
 
     def __init__(
         self, buffers: Sequence["LifetimeBoundBuffer"], size: int, alignment: int = 128
@@ -294,6 +635,9 @@ class MemoryPlanSolver(ABC):
                 defaults to.
         """
         self.buffers: list["LifetimeBoundBuffer"] = list(buffers)
+        assert self.supports_paired_buffers or not any(
+            buffer.paired_with for buffer in self.buffers
+        ), f"{type(self).__name__} does not support paired-buffer placement"
         self.limit = size
         self.alignment = alignment
         self.spill_reasons: dict[str, str] = {}
@@ -363,8 +707,17 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     special case where there is nothing to choose.
     """
 
+    # Whether this engine decides LX relayouts: places a
+    # :class:`RelayoutCopyBuffer` under the coupling its docstring lists and
+    # writes ``chosen_relayouts`` back on the consumers it serves. The allocator
+    # enumerates candidates and builds copies only for engines that say so; the
+    # others never see a copy and their objective carries no relayout term.
+    decides_lx_relayouts: bool = False
+
     @abstractmethod
-    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(
+        self, cost_expr: sympy.Expr | None = None
+    ) -> list[CoreDivisionBuffer]:
         """Choose each buffer's core division and its LX placement together.
 
         On top of the :meth:`plan_layout` contract, implementations write the

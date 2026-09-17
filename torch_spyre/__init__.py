@@ -16,6 +16,7 @@ import os
 import threading
 import types
 import importlib
+
 import torch
 
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
@@ -190,10 +191,8 @@ def make_spyre_module() -> types.ModuleType:
     mod.set_device = lambda idx: impl.set_device(idx)
     mod._is_compiled = lambda: True
     mod.memory = memory
-
-    from torch_spyre.profiler._ffdc import get_diagnostic_report
-
-    mod.get_diagnostic_report = get_diagnostic_report
+    # Public profiler API (eagerly imported above); avoid private _ffdc import.
+    mod.get_diagnostic_report = profiler.get_diagnostic_report
 
     import torch  # noqa: E402
 
@@ -260,6 +259,29 @@ def _autoload():
         return
     _autoload._ran = True
 
+    try:
+        _autoload_impl()
+    except BaseException:
+        # PyTorch's _import_device_backends() catches whatever this entrypoint
+        # raises and re-raises a generic "Failed to load the backend extension:
+        # torch_spyre" RuntimeError. In CI logs the chained cause is often not
+        # printed, so the real reason (e.g. an ImportError for an undefined
+        # symbol in a native runtime library such as libspyre_comms /
+        # libflex) is hidden and the failure looks like a mystery. Log the full
+        # traceback here, before control returns to PyTorch, then re-raise so
+        # behaviour is otherwise unchanged.
+        import sys
+        import traceback
+
+        print(
+            "torch_spyre backend autoload failed; underlying error follows:",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+        raise
+
+
+def _autoload_impl():
     import torch  # noqa: E402
 
     # Set all the appropriate state on PyTorch
@@ -297,6 +319,17 @@ def _autoload():
     # Customops must be imported here because decompositions.py references
     # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
     import torch_spyre._inductor.customops  # noqa: F401
+
+    # lowering.py is normally imported lazily, only when enable_spyre_context()
+    # actually runs (i.e. only for compiles Inductor detects as Spyre-bound).
+    # tile_dim_marker's lowering is registered directly into the real global
+    # torch._inductor.lowering.lowerings dict (not the CM-scoped
+    # spyre_lowerings dict most Spyre lowerings use) precisely so it is always
+    # present -- including for device-agnostic compiles that never enter Spyre
+    # context, e.g. for_each_tile exercised directly on CPU tensors. That
+    # registration only takes effect once this module has actually executed,
+    # so import it eagerly here rather than leaving it to the lazy path.
+    import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.decompositions import (
         _register_spyre_dispatchkey_kernels_permanently,
     )
@@ -377,7 +410,3 @@ def _autoload():
 
     # Enable spyre code with symbolic args by default
     os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")
-
-
-if not profiler.is_available():
-    profiler = None

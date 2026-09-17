@@ -26,6 +26,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 from torch.spyre import SpyreTensorLayout, get_device_dtype
+from torch_spyre._C import DataFormats, ElementArrangement, get_device_size_in_bytes
 
 
 @instantiate_parametrized_tests
@@ -35,6 +36,59 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
+
+    @parametrize(
+        "df,eps,bits",
+        [
+            (DataFormats.SEN169_FP16, 64, 16),
+            (DataFormats.IEEE_FP32, 32, 32),
+            (DataFormats.SEN143_FP8, 128, 8),
+            (DataFormats.SENINT4, 256, 4),
+            (DataFormats.SENINT2, 512, 2),
+            (DataFormats.IEEE_INT32, 32, 32),
+            (DataFormats.IEEE_INT64, 16, 64),
+            (DataFormats.BOOL, 128, 8),
+            (DataFormats.BFLOAT16, 64, 16),
+        ],
+    )
+    def test_device_storage_size(self, df, eps, bits):
+        self.assertEqual(df.elems_per_stick(), eps)
+        for ea in ElementArrangement.__members__.values():
+            # Both normal and shortened/sparse trailing extents occupy full
+            # sticks. Empty outer geometry remains empty after FP8 rescaling.
+            for outer, inner in [(3, eps), (3, 1), (0, eps)]:
+                stl = SpyreTensorLayout([outer, inner], [eps, 1], df, ea)
+                expected = outer * eps * bits // 8
+                self.assertEqual(get_device_size_in_bytes(stl), expected)
+                self.assertEqual(
+                    get_device_size_in_bytes(stl.device_size, df), expected
+                )
+
+    @parametrize(
+        "df",
+        [
+            DataFormats.INVALID,
+            DataFormats.SEN153_FP9,
+            DataFormats.SENINT24,
+            DataFormats.SEN18F_FP24,
+        ],
+    )
+    def test_unmapped_compute_format_has_no_storage_size(self, df):
+        with self.assertRaisesRegex(RuntimeError, "No device stick geometry"):
+            get_device_size_in_bytes([1, 64], df)
+
+    @parametrize(
+        "df,dtype",
+        [(DataFormats.BFLOAT16, torch.float32), (DataFormats.IEEE_INT64, torch.int32)],
+    )
+    def test_explicit_transfer_storage_roundtrip(self, df, dtype):
+        # Explicit transfer encodings differ from default compute storage.
+        x = torch.arange(64, dtype=dtype)
+        eps = df.elems_per_stick()
+        stl = SpyreTensorLayout([64 // eps, eps], [eps, 1], df)
+        y = x.to("spyre", device_layout=stl)
+        self.assertEqual(y.device_tensor_layout().device_dtype, df)
+        self.assertEqual(y.cpu(), x)
 
     def test_default_layout(self):
         stl = SpyreTensorLayout([], torch.float16)
@@ -466,6 +520,27 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.device_size, [4, 512, 64])
         self.assertEqual(stl.stride_map, [64, 256, 1])
 
+    def test_to_same_layout_honors_a_different_explicit_device(self):
+        """A matching layout must not bypass an explicit cross-device copy."""
+        if torch.spyre.device_count() < 2:
+            self.skipTest("requires at least two Spyre devices")
+
+        previous = torch.spyre.current_device()
+        target = torch.device("spyre", (previous + 1) % torch.spyre.device_count())
+        x = torch.rand([128, 256], dtype=torch.float16)
+        layout = SpyreTensorLayout(list(x.shape), x.dtype)
+        source = x.to(torch.device("spyre", previous), device_layout=layout)
+
+        result = source.to(target, device_layout=layout)
+
+        self.assertIsNot(result, source)
+        self.assertEqual(source.device, torch.device("spyre", previous))
+        self.assertEqual(result.device, target)
+        self.assertEqual(result.device_tensor_layout(), layout)
+        round_trip = result.to(source.device, device_layout=layout, copy=True)
+        torch.testing.assert_close(round_trip.cpu(), x, rtol=2e-3, atol=1e-4)
+        self.assertEqual(torch.spyre.current_device(), previous)
+
     def test_empty_layout_patched(self):
         x_stl = SpyreTensorLayout(
             [512, 8, 256], [2048, 256, 1], torch.float16, [2, 1, 0]
@@ -547,6 +622,179 @@ class TestSpyreTensorLayout(TestCase):
             count_after_custom,
             "Expected cache hit when SpyreTensorLayout is the same as previous call",
         )
+
+    def test_flattened_attention_view_feeds_linear_across_compiles(self):
+        """A BLHD-backed BHLD result must be safe for a later projection.
+
+        Attention kernels naturally produce ``[B,H,L,D]`` with token-major
+        backing storage. A separately compiled transpose+reshape therefore
+        returns a logically contiguous ``[B,L,H*D]`` view whose device layout
+        still has H and D factorized. The next compiled linear must canonicalize
+        that input instead of presenting two contraction dimensions to the
+        backend.
+        """
+        B, L, H, D = 1, 8, 32, 128
+        hidden = H * D
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(B, L, hidden, dtype=torch.float16)
+        weight = torch.randn(hidden, hidden, dtype=torch.float16) / hidden**0.5
+        residual = torch.randn(B, L, hidden, dtype=torch.float16)
+        expected = torch.nn.functional.linear(x, weight) + residual
+
+        def project(x, weight, residual):
+            return torch.nn.functional.linear(x, weight) + residual
+
+        factorized_layout = SpyreTensorLayout(
+            [L, D // 64, H, 64],
+            [hidden, 64, D, 1],
+            get_device_dtype(torch.float16),
+        )
+        flattened = x.to(device_layout=factorized_layout)
+        self.assertEqual(flattened.device_tensor_layout(), factorized_layout)
+        actual = torch.compile(project, dynamic=False)(
+            flattened, weight.to("spyre"), residual.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+    @parametrize("H,N_KV,LQ", [(4, 2, 8), (32, 8, 1)])
+    def test_sdpa_output_feeds_linear_in_same_graph(self, H, N_KV, LQ):
+        """A fused SDPA -> BL(H*D) view -> linear gets one contraction dim."""
+        B, LK, D = 1, 64, 128
+        hidden = H * D
+        q = torch.randn(B, H, LQ, D, dtype=torch.float16)
+        k = torch.randn(B, N_KV, LK, D, dtype=torch.float16)
+        v = torch.randn(B, N_KV, LK, D, dtype=torch.float16)
+        weight = torch.randn(hidden, hidden, dtype=torch.float16) / hidden**0.5
+        query_positions = torch.arange(LK - LQ, LK).view(1, 1, LQ, 1)
+        key_positions = torch.arange(LK).view(1, 1, 1, LK)
+        mask = torch.where(
+            key_positions <= query_positions,
+            torch.tensor(0.0, dtype=torch.float16),
+            torch.tensor(torch.finfo(torch.float16).min / 2, dtype=torch.float16),
+        )
+
+        def attention_project(q, k, v, mask, weight):
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=D**-0.5,
+                enable_gqa=True,
+            )
+            out = out.transpose(1, 2).reshape(B, LQ, hidden)
+            return torch.nn.functional.linear(out, weight)
+
+        expected = attention_project(q, k, v, mask, weight)
+        actual = torch.compile(attention_project, dynamic=False)(
+            q.to("spyre"),
+            k.to("spyre"),
+            v.to("spyre"),
+            mask.to("spyre"),
+            weight.to("spyre"),
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.1)
+
+    def test_rescale_for_dtype_rejects_inexact_stick_rescale(self):
+        """A stick-indexing dim that does not hold a whole number of output
+        sticks must raise, not floor.
+
+        Widening the stick depth shrinks the num-sticks dim by the depth ratio.
+        Flooring an inexact ratio drops data, and a single input stick floors to
+        zero; such a layout describes no tensor, and it used to reach
+        ``get_device_stride_infos``, which divided by it and killed the process
+        with SIGFPE rather than raising (issue #3604). Needs no device.
+        """
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
+
+        fp32 = get_device_dtype(torch.float32)
+        # One fp32 stick (32 elements): 1 * 32 // 64 == 0 going to fp16.
+        one_stick = SpyreTensorLayout(
+            [1, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+        )
+        with self.assertRaisesRegex(Unsupported, "not a whole number of 64-element"):
+            rescale_stl_for_dtype(one_stick, torch.float16, ElementArrangement.STANDARD)
+        # Three fp32 sticks (96 elements): flooring to one fp16 stick would
+        # silently drop 32 elements.
+        three_sticks = SpyreTensorLayout(
+            [3, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+        )
+        with self.assertRaisesRegex(Unsupported, "3 stick\\(s\\) of 32 elements"):
+            rescale_stl_for_dtype(
+                three_sticks, torch.float16, ElementArrangement.STANDARD
+            )
+        # An exact ratio rescales as before.
+        two_sticks = SpyreTensorLayout(
+            [2, 4, 32], [32, 32, 1], fp32, ElementArrangement.STANDARD
+        )
+        rescaled = rescale_stl_for_dtype(
+            two_sticks, torch.float16, ElementArrangement.STANDARD
+        )
+        self.assertEqual(list(rescaled.device_size), [1, 4, 64])
+        self.assertEqual(list(rescaled.stride_map), [64, 32, 1])
+
+    def test_qfp8ch_layout_rounds_a_partial_stick_up(self):
+        """qfp8ch's fp16 -> fp8 output may end in a partially filled fp8 stick:
+        one fp16 stick becomes one (half-filled) 128-element fp8 stick, never a
+        size-0 dim. The fp8 -> fp16 conversion that consumes this output
+        rebuilds a dense layout from the host size, so the partial stick is the
+        padded case it already handles."""
+        from torch_spyre._C import ElementArrangement
+        from torch_spyre._inductor.propagate_layouts import _qfp8ch_stl
+
+        fp16 = get_device_dtype(torch.float16)
+        one_stick = SpyreTensorLayout(
+            [1, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
+        )
+        out = _qfp8ch_stl(one_stick, torch.float8_e4m3fn)
+        self.assertEqual(list(out.device_size), [1, 4, 128])
+        self.assertEqual(list(out.stride_map), [128, 64, 1])
+        self.assertEqual(out.element_arrangement, ElementArrangement.QFP8CH)
+        three_sticks = SpyreTensorLayout(
+            [3, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
+        )
+        self.assertEqual(
+            list(_qfp8ch_stl(three_sticks, torch.float8_e4m3fn).device_size),
+            [2, 4, 128],
+        )
+        two_sticks = SpyreTensorLayout(
+            [2, 4, 64], [64, 64, 1], fp16, ElementArrangement.STANDARD
+        )
+        self.assertEqual(
+            list(_qfp8ch_stl(two_sticks, torch.float8_e4m3fn).device_size), [1, 4, 128]
+        )
+
+    def test_explicit_layout_rejects_malformed_device_size(self):
+        """The explicit (device_size, stride_map) constructor validates the one
+        invariant every consumer assumes: non-negative device dims, one
+        stride_map entry each. A negative dim is rejected at construction
+        instead of crashing the process later. A size-0 dim is how an empty
+        tensor is laid out and stays legal; the degenerate size-0 dim behind
+        issue #3604 is refused by rescale_stl_for_dtype instead."""
+        from torch_spyre._C import ElementArrangement
+
+        fp16 = get_device_dtype(torch.float16)
+        with self.assertRaisesRegex(
+            RuntimeError, "device dimension 0 has negative size -1"
+        ):
+            SpyreTensorLayout(
+                [-1, 4, 64], [64, 32, 1], fp16, ElementArrangement.STANDARD
+            )
+        empty = SpyreTensorLayout(
+            [0, 4, 64], [64, 32, 1], fp16, ElementArrangement.STANDARD
+        )
+        self.assertEqual(list(empty.device_size), [0, 4, 64])
+        self.assertEqual(get_device_size_in_bytes(empty), 0)
+        with self.assertRaisesRegex(RuntimeError, "stride_map has 2 entries for 3"):
+            SpyreTensorLayout([1, 4, 64], [64, 1], fp16, ElementArrangement.STANDARD)
+        # -1 (size-1 / sparse) and 0 (broadcast) stride entries stay legal.
+        ok = SpyreTensorLayout(
+            [1, 4, 64], [-1, 0, 1], fp16, ElementArrangement.STANDARD
+        )
+        self.assertEqual(list(ok.device_size), [1, 4, 64])
 
 
 if __name__ == "__main__":

@@ -17,15 +17,19 @@ Filter OOT test suite configs by TEST_TYPE label or suite-prefix group.
 
 Selection rules
 ---------------
-  (empty) / "full"   All configs (backward compatible by default).
   "smoke"            Configs whose test_suite_config.labels contains "smoke".
-  "core"             Configs whose test_suite_config.labels contains "core".
-  "device_critical"  Configs whose test_suite_config.labels contains
-                     "device_critical" -- the device-layer surfaces flex and
+  "unit"             Configs whose test_suite_config.labels contains "unit".
+  "integration"      Configs whose test_suite_config.labels contains
+                     "integration" -- the device-layer surfaces flex and
                      deeptools/dxp_standalone exercise most (streams, job
                      launch plans, codegen, LX/scratchpad planning, tensor
                      layout, allocator/GC, D2D copies). Used as the default
-                     test_type for the tests.yml CI workflow.
+                     test_type for integration-tests.yaml.
+  "regression"       Configs whose test_suite_config.labels contains
+                     "regression" -- the full functional-coverage tier.
+  "trunk"            Configs whose test_suite_config.labels contains
+                     "trunk" -- everything torch-spyre's push-to-main
+                     workflows cover.
   "suite_<group>"    Configs residing inside a directory named "<group>", or
                      whose filename starts with "<group>_".  This lets the
                      existing <group>/<name>_config.yaml layout act as a
@@ -33,25 +37,18 @@ Selection rules
   <other>            Treated as an arbitrary label name; matches configs
                      whose labels array contains the value.
 
-User-facing tier aliases
--------------------------
-Every caller (Makefile, GHA _test_matrix.yaml, Jenkins, config.yaml) resolves
---test-type through this one script, so the alias mapping lives here once and
-every caller sees it consistently:
-  "unit"          -> "core"
-  "integration"   -> "device_critical"
-  "regression"    -> "full"
-  "trunk"         -> "full" (push-to-main CI; same coverage as full)
-  "smoke"         -> "smoke" (already the canonical spelling, no change)
-These are the names meant for humans/CI configs to type; device_critical/full/
-core keep their existing, more specific meaning as the actual label vocabulary
-tests/configs/**/*.yaml declares.
+These tier names (smoke/unit/integration/regression/trunk) ARE the label
+vocabulary tests/configs/**/*.yaml declares -- there is no separate alias
+layer translating human-facing names to internal label names.
 
-Configs with no labels field default to ["full"] (backward compatible) --
-they run under "full" but are excluded from every narrower test_type
-(smoke, core, device_critical, suite_<group>, custom labels). Every config
-should carry an explicit labels list; an unlabeled config is a gap to close
-by adding one, not a signal to widen matching.
+Only explicitly declared labels are respected: a config's
+test_suite_config.labels array is matched literally against --test-type, with
+no catch-all value that matches regardless of labels. Configs with no labels
+field match nothing -- they are excluded from every test_type, including
+regression and trunk. Every config must carry an explicit labels list; an
+unlabeled config is a gap to close by adding one (see
+tests/scripts/check_oot_configs.py, which fails CI on missing labels), not a
+signal to widen matching.
 
 Output formats
 --------------
@@ -79,7 +76,7 @@ Usage
   # GitHub Actions generate_matrix job
   python3 tests/oot_framework/utils/filter_configs.py \\
       --config-dir tests/configs/torch_spyre_tests \\
-      --test-type core \\
+      --test-type unit \\
       --runner-map .github/runner_overrides.yaml \\
       --format matrix-json
 """
@@ -124,11 +121,11 @@ def _display_name(config_path: Path, config_dir: Path) -> str:
 
 
 def _load_labels(path: Path) -> list:
-    """Read test_suite_config.labels from a YAML config; default to ["full"]."""
+    """Read test_suite_config.labels from a YAML config; no labels means no match."""
     with path.open() as fh:
         raw = yaml.safe_load(fh) or {}
     tsc = raw.get("test_suite_config") or {}
-    return list(tsc.get("labels", ["full"]))
+    return list(tsc.get("labels") or [])
 
 
 def _load_runner_map(runner_map_path: str) -> dict:
@@ -141,26 +138,19 @@ def _load_runner_map(runner_map_path: str) -> dict:
     return {k: str(v) for k, v in data.items()}
 
 
-# User-facing tier name -> actual test_suite_config.labels vocabulary. Single
-# source of truth: every caller (Makefile, _test_matrix.yaml, Jenkins,
-# config.yaml) shells out to this script, so resolving here is sufficient --
-# no caller needs its own copy of this mapping.
-TEST_TYPE_ALIASES = {
-    "unit": "core",
-    "integration": "device_critical",
-    "regression": "full",
-    "trunk": "full",
-}
-
-
-def resolve_test_type(test_type: str) -> str:
-    """Resolve a user-facing tier alias to its underlying label/value."""
-    return TEST_TYPE_ALIASES.get(test_type, test_type)
+# The tier ladder. A config's labels also carry suite groups and one-off markers;
+# those are not tiers and must never make a config look already-covered.
+TIER_LABELS = ("smoke", "unit", "integration", "regression", "trunk")
 
 
 def _matches(labels: list, config_path: Path, test_type: str) -> bool:
-    """Return True if *config_path* should be included for *test_type*."""
-    if not test_type or test_type == "full":
+    """Return True if *config_path* should be included for *test_type*.
+
+    No catch-all: every test_type (including regression/trunk) must appear
+    literally in the config's labels array. An empty test_type matches
+    everything (used only when a caller deliberately omits filtering).
+    """
+    if not test_type:
         return True
 
     if test_type.startswith("suite_"):
@@ -172,6 +162,27 @@ def _matches(labels: list, config_path: Path, test_type: str) -> bool:
         return stem.startswith(group + "_") or stem == group
 
     return test_type in labels
+
+
+def _already_covered(labels: list, exclude_tiers: list) -> bool:
+    """True when this config was already executed by one of the covered tiers.
+
+    The test is whether any ALREADY-COVERED tier selects this config -- not whether
+    every tier it declares is covered. A config labeled
+    [unit, regression, integration, trunk] was already run by the integration run,
+    so a later regression run re-executes identical work; its `trunk` label is
+    irrelevant because no trunk run happened.
+
+    Set difference over DECLARED labels, never a ladder. Measured on the 213 live
+    configs: all 59 integration configs also declare regression, so integration is
+    an exact subset here and the regression delta is 73 configs. That is a property
+    of these files, NOT a rule -- prod showed 616 case-level
+    integration-not-in-trunk violations, so inferring the ladder instead of reading
+    the labels would silently drop real tests.
+    """
+    if not exclude_tiers:
+        return False
+    return any(t in labels for t in exclude_tiers)
 
 
 # ---------------------------------------------------------------------------
@@ -190,12 +201,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--test-type",
-        default="full",
+        default="regression",
         metavar="TYPE",
         help=(
-            "Selection type: smoke | core | full | device_critical | "
-            "suite_<group> | <label> -- or the user-facing tier aliases "
-            "unit | integration | regression. Default: full (all configs)."
+            "Selection type: smoke | unit | integration | regression | "
+            "trunk | suite_<group> | <label>. Matches configs whose "
+            "test_suite_config.labels array contains this value literally "
+            "-- no catch-all. Default: regression."
         ),
     )
     ap.add_argument(
@@ -206,6 +218,17 @@ def main() -> None:
             "Optional YAML file mapping config-relative paths to CI runner labels. "
             "Only used with --format matrix-json. "
             "Suites not in the map use the default runner (spyre_pf_x1)."
+        ),
+    )
+    ap.add_argument(
+        "--exclude-tiers",
+        default="",
+        help=(
+            "Comma-separated tiers whose results already exist for this artifact. "
+            "A config is dropped when ANY tier it declares is in this list: that tier "
+            "already covered the config, so re-running it adds nothing. Empty (the "
+            "default) runs the full tier -- which is what an unreachable ClickHouse "
+            "degrades to."
         ),
     )
     ap.add_argument(
@@ -223,29 +246,46 @@ def main() -> None:
     if not config_dir.is_dir():
         sys.exit(f"ERROR: --config-dir does not exist: {config_dir}")
 
-    test_type = resolve_test_type(args.test_type.strip())
+    test_type = args.test_type.strip()
+    exclude_tiers = [
+        t.strip() for t in (args.exclude_tiers or "").split(",") if t.strip()
+    ]
+    # Never let a tier suppress itself: an explicit rerun of a tier must re-execute.
+    exclude_tiers = [t for t in exclude_tiers if t != test_type]
 
     runner_map: dict = {}
     if args.runner_map:
         runner_map = _load_runner_map(args.runner_map)
 
     results = []
+    skipped_covered = 0
     for cfg in sorted(config_dir.rglob("*.yaml")):
         try:
             labels = _load_labels(cfg)
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: skipping {cfg} ({exc})", file=sys.stderr)
             continue
-        if _matches(labels, cfg, test_type):
-            rel = str(cfg.relative_to(config_dir))
-            results.append(
-                {
-                    "name": _display_name(cfg, config_dir),
-                    "config": rel,
-                    "runner": runner_map.get(rel, "spyre_pf_x1"),
-                    "path": str(cfg),
-                }
-            )
+        if not _matches(labels, cfg, test_type):
+            continue
+        if _already_covered(labels, exclude_tiers):
+            skipped_covered += 1
+            continue
+        rel = str(cfg.relative_to(config_dir))
+        results.append(
+            {
+                "name": _display_name(cfg, config_dir),
+                "config": rel,
+                "runner": runner_map.get(rel, "spyre_pf_x1"),
+                "path": str(cfg),
+            }
+        )
+
+    if skipped_covered:
+        print(
+            f"delta: skipped {skipped_covered} config(s) whose tiers are all already "
+            f"covered ({','.join(exclude_tiers)})",
+            file=sys.stderr,
+        )
 
     if not results:
         print(

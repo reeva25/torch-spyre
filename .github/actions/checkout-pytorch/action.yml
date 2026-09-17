@@ -8,19 +8,16 @@ inputs:
   torch_spyre_dir:
     description: Path to the pre-cloned torch-spyre directory
     required: false
-    type: string
     default: torch-spyre
   pytorch_dir:
     description: Path to clone the pytorch directory to
     required: false
-    type: string
     default: pytorch
   sha:
     description: |
       Exact PyTorch commit SHA to check out. If set, takes precedence over
       the pyproject.toml-derived release branch below.
     required: false
-    type: string
     default: ''
 
 runs:
@@ -36,6 +33,18 @@ runs:
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
+
+        # Retry helper for failing commands
+        retry() {
+          local attempt=1 max=4 delay=5
+          until "$@"; do
+            if (( attempt >= max )); then return 1; fi
+            echo "Command failed (attempt ${attempt}/${max}); retrying in ${delay}s..." >&2
+            sleep "$delay"
+            delay=$(( delay * 2 ))
+            attempt=$(( attempt + 1 ))
+          done
+        }
 
         [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
         [[ "$PYTORCH_DIR" != /* ]] && PYTORCH_DIR="${PWD}/${PYTORCH_DIR}"
@@ -78,7 +87,7 @@ runs:
           git remote add origin "$PYTORCH_REPO_URL"
         fi
 
-        git fetch --depth=1 origin "$FETCH_REF"
+        retry git fetch --depth=1 origin "$FETCH_REF"
 
         # Self-hosted runners may reuse a workspace across jobs; a previous
         # run's build (generated files, permission/line-ending changes from
@@ -90,7 +99,7 @@ runs:
 
         git submodule sync --recursive
         git submodule foreach --recursive 'git reset --hard HEAD && git clean -fdx' >/dev/null 2>&1 || true
-        git submodule update --init --recursive --depth 1 --jobs 8 --force
+        retry git submodule update --init --recursive --depth 1 --jobs 8 --force
 
         git log -1 --oneline || true
 

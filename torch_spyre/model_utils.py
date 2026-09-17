@@ -23,6 +23,11 @@ which tells the DMA engine to stickify along host dim-0 (out_features)
 instead of the default last dim (in_features). No CPU transpose or
 intermediate copy is required.
 
+``nn.Embedding`` tables are instead read as a gather (indexed by token id
+along the vocab/leading dim), so they get a gather-optimal "indirect
+access" layout -- vocab dim outermost, hidden dim split into sticks --
+rather than the matmul or default layout.
+
 Critically, the tensor's PyTorch shape stays ``(out, in)`` -- only the
 *device* layout changes. This means:
 
@@ -48,6 +53,8 @@ Usage::
     patch_module_to_for_spyre()
     model.to("spyre")
 """
+
+import warnings
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -86,24 +93,44 @@ def _validate_target_dtype(dtype: torch.dtype) -> None:
         )
 
 
+def _normalize_spyre_device(
+    device: torch.device | str | int | None,
+) -> torch.device | None:
+    """Initialize Spyre and normalize a DMA helper's destination device."""
+    _ensure_spyre_runtime()
+    if device is None:
+        return None
+    target = (
+        torch.device(DEVICE_NAME, device)
+        if isinstance(device, int)
+        else torch.device(device)
+    )
+    if target.type != DEVICE_NAME:
+        raise ValueError(f"Expected a Spyre destination, got {target}")
+    return target
+
+
 # --- DMA helpers -----------------------------------------------------
 
 
 def _dma_to_spyre_default(
     cpu_tensor: torch.Tensor,
     target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
 ) -> torch.Tensor:
     """Transfer a CPU tensor to Spyre with the default layout.
 
     Used for non-Linear-weight tensors (biases, embeddings, layer norm
     parameters, buffers). Stickifies along the last dimension.
     """
+    device = _normalize_spyre_device(device)
     if not cpu_tensor.is_contiguous():
         cpu_tensor = cpu_tensor.contiguous()
     dev_dtype = target_dtype if target_dtype is not None else cpu_tensor.dtype
     layout = SpyreTensorLayout(list(cpu_tensor.shape), dev_dtype)
     dst = spyre_empty_with_layout(
-        cpu_tensor.size(), cpu_tensor.stride(), dev_dtype, layout
+        cpu_tensor.size(), cpu_tensor.stride(), dev_dtype, layout, device=device
     )
     copy_tensor(cpu_tensor, dst, non_blocking=False)
     return dst
@@ -112,6 +139,8 @@ def _dma_to_spyre_default(
 def _dma_to_spyre_dim_order_swapped(
     weight: torch.Tensor,
     target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
 ) -> torch.Tensor:
     """Transfer a 2D Linear weight to Spyre with dim_order=[1, 0].
 
@@ -124,6 +153,7 @@ def _dma_to_spyre_dim_order_swapped(
     Caller must ensure ``weight.ndim == 2``.
     """
     assert weight.ndim == 2, "dim_order=[1,0] path is for 2D weights only"
+    device = _normalize_spyre_device(device)
 
     if not weight.is_contiguous():
         weight = weight.contiguous()
@@ -134,8 +164,144 @@ def _dma_to_spyre_dim_order_swapped(
         dev_dtype,
         [1, 0],  # dim_order: stick on dim-0 = out_features
     )
-    dst = spyre_empty_with_layout(weight.size(), weight.stride(), dev_dtype, layout)
+    dst = spyre_empty_with_layout(
+        weight.size(), weight.stride(), dev_dtype, layout, device=device
+    )
     copy_tensor(weight, dst, non_blocking=False)
+    return dst
+
+
+def _dma_to_spyre_indirect_access(
+    weight: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
+) -> torch.Tensor | None:
+    """Transfer a 2D ``nn.Embedding`` table to Spyre with a gather-optimal layout.
+
+    An embedding table is read as a gather (indexed by token id along the
+    vocab/leading dim), not a matmul, so it wants a different device layout
+    than the row-major matmul weights: the vocab dim outermost and the hidden
+    dim split into stick-sized blocks, i.e. device dims
+    ``[rows, D // eps, eps]`` where ``eps`` is the elements-per-stick for the
+    device dtype. This is the "indirect access" layout the gather source
+    needs (indexed dim outermost); see the tensors-and-layouts docs.
+
+    Uses the 3-arg device-dims ``SpyreTensorLayout`` overload with the *device*
+    dtype (``get_device_dtype``), not the host ``torch.dtype``.
+
+    Requires ``D % eps == 0``; otherwise the sticks can't tile the hidden dim,
+    so we warn and return ``None`` to signal the caller to fall back to the
+    default layout, which still loads and runs, just without the gather
+    optimization.
+
+    Caller must ensure ``weight.ndim == 2``.
+    """
+    assert weight.ndim == 2, "indirect-access path is for 2D embedding tables only"
+    device = _normalize_spyre_device(device)
+
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    dev_dtype = target_dtype if target_dtype is not None else weight.dtype
+
+    rows, d = weight.shape
+    # elems_per_stick is dtype-aware (64 at fp16/bf16, 32 at fp32), so query it
+    # rather than hardcoding a stick size.
+    eps = SpyreTensorLayout(list(weight.shape), dev_dtype).elems_per_stick()
+    if d % eps != 0:
+        warnings.warn(
+            f"Embedding hidden dim {d} is not a multiple of the Spyre stick "
+            f"size {eps} for dtype {dev_dtype}; falling back to the default "
+            "layout (no gather optimization) for this embedding table.",
+            stacklevel=2,
+        )
+        return None
+
+    layout = SpyreTensorLayout(
+        [rows, d // eps, eps],  # device_size: vocab dim outermost
+        [d, eps, 1],  # stride_map
+        get_device_dtype(dev_dtype),
+    )
+    dst = spyre_empty_with_layout(
+        weight.size(), weight.stride(), dev_dtype, layout, device=device
+    )
+    copy_tensor(weight, dst, non_blocking=False)
+    return dst
+
+
+def dma_moe_expert_weight_to_spyre(
+    weight: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
+) -> torch.Tensor | None:
+    """Transfer ``[E, C, F]`` weights in a gather- and matmul-friendly layout.
+
+    The device layout is ``[E, C, F // eps, eps]``. Returns ``None`` when
+    ``F`` does not span complete sticks.
+    """
+    assert weight.ndim == 3, "MoE expert-weight path is for rank-3 [E,C,F] only"
+    device = _normalize_spyre_device(device)
+
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    dev_dtype = target_dtype if target_dtype is not None else weight.dtype
+
+    experts, contract, free = weight.shape
+    eps = SpyreTensorLayout(list(weight.shape), dev_dtype).elems_per_stick()
+    if free % eps != 0:
+        warnings.warn(
+            f"MoE expert-weight free dim {free} is not a multiple of the Spyre "
+            f"stick size {eps} for dtype {dev_dtype}; falling back to the "
+            "default layout (no shared-layout optimization) for this weight.",
+            stacklevel=2,
+        )
+        return None
+
+    layout = SpyreTensorLayout(
+        [experts, contract, free // eps, eps],
+        [contract * free, free, eps, 1],
+        get_device_dtype(dev_dtype),
+    )
+    dst = spyre_empty_with_layout(
+        weight.size(), weight.stride(), dev_dtype, layout, device=device
+    )
+    copy_tensor(weight, dst, non_blocking=False)
+    return dst
+
+
+def dma_moe_per_expert_scale_to_spyre(
+    scale: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+    *,
+    device: torch.device | str | int | None = None,
+) -> torch.Tensor | None:
+    """Transfer ``[E]`` scales as a gather-ready ``[E, eps]`` tensor.
+
+    Each scale fills one stick. Widening on the host avoids an unsupported
+    in-graph rank expansion.
+    """
+    assert scale.ndim == 1, "per-expert-scale path is for 1D [E] tensors only"
+    device = _normalize_spyre_device(device)
+
+    if not scale.is_contiguous():
+        scale = scale.contiguous()
+    dev_dtype = target_dtype if target_dtype is not None else scale.dtype
+
+    experts = scale.shape[0]
+    eps = SpyreTensorLayout([experts, 1], dev_dtype).elems_per_stick()
+
+    widened = scale[:, None].expand(-1, eps).contiguous()
+
+    layout = SpyreTensorLayout(
+        [experts, 1, eps],
+        [eps, eps, 1],
+        get_device_dtype(dev_dtype),
+    )
+    dst = spyre_empty_with_layout(
+        widened.size(), widened.stride(), dev_dtype, layout, device=device
+    )
+    copy_tensor(widened, dst, non_blocking=False)
     return dst
 
 
@@ -158,8 +324,9 @@ def _transfer_module(
 
     Mirrors ``nn.Module._apply``'s virtual recursion: a submodule that overrides
     ``_apply`` is delegated to and pruned from the walk. Normal modules get the
-    optimal ``dim_order=[1, 0]`` layout for 2D ``nn.Linear`` weights and the
-    default layout for everything else. Tensors already on Spyre are skipped
+    optimal ``dim_order=[1, 0]`` layout for 2D ``nn.Linear`` weights, the
+    gather-optimal indirect-access layout for 2D ``nn.Embedding`` tables, and
+    the default layout for everything else. Tensors already on Spyre are skipped
     (idempotent). ``counts`` accumulates transferred-tensor tallies for logging;
     ``prefix`` is the module's dotted path (as in ``named_modules``) for logs.
     """
@@ -176,12 +343,15 @@ def _transfer_module(
         _transfer_module(child, dtype, counts, child_prefix)
 
     is_linear = isinstance(module, nn.Linear)
+    is_embedding = isinstance(module, nn.Embedding)
     for name, param in list(module._parameters.items()):
         if param is None or param.device.type == DEVICE_NAME:
             continue
         p = param.data
-        # 2D Linear weight -> optimal stickified layout; everything else
-        # (bias, embeddings, norms, ...) -> default layout.
+        # 2D Linear weight -> optimal stickified matmul layout; 2D Embedding
+        # table -> gather-optimal indirect-access layout; everything else
+        # (bias, norms, ...) -> default layout.
+        dev = None
         if is_linear and name == "weight" and p.ndim == 2:
             logger.debug(
                 "  %s.%s: shape=%s -> Spyre dim_order=[1, 0]",
@@ -191,7 +361,19 @@ def _transfer_module(
             )
             dev = _dma_to_spyre_dim_order_swapped(p, target_dtype=dtype)
             counts["linear"] += 1
-        else:
+        elif is_embedding and name == "weight" and p.ndim == 2:
+            dev = _dma_to_spyre_indirect_access(p, target_dtype=dtype)
+            # dev is None if the hidden dim doesn't tile into sticks; the helper
+            # has already warned, so fall through to the default layout below.
+            if dev is not None:
+                logger.debug(
+                    "  %s.%s: shape=%s -> Spyre indirect-access (gather) layout",
+                    prefix,
+                    name,
+                    list(p.shape),
+                )
+                counts["embedding"] += 1
+        if dev is None:
             logger.debug(
                 "  %s.%s: shape=%s -> Spyre default layout",
                 prefix,
@@ -220,6 +402,12 @@ def load_model_to_spyre(
     (optimal for Spyre matmul). Tensor shapes are preserved, so the
     model works unmodified with the existing inference path.
 
+    For each ``nn.Embedding``, the table is transferred with a
+    gather-optimal indirect-access layout (vocab dim outermost, hidden
+    dim split into sticks) so the token-id gather runs efficiently. If
+    the hidden dim doesn't tile into sticks, it falls back to the
+    default layout with a warning.
+
     All other parameters and buffers use the default Spyre layout.
 
     Submodules that override ``_apply`` are honored, matching ``nn.Module.to`` semantics.
@@ -230,13 +418,14 @@ def load_model_to_spyre(
     # Ensure Spyre runtime is initialized before using _C functions
     _ensure_spyre_runtime()
 
-    counts = {"linear": 0, "other": 0, "buffer": 0}
+    counts = {"linear": 0, "embedding": 0, "other": 0, "buffer": 0}
     _transfer_module(model, dtype, counts)
     logger.info(
-        "load_model_to_spyre: %d Linear weights optimized "
-        "(dim_order=[1,0]), %d other params and %d buffers "
-        "transferred with default layout",
+        "load_model_to_spyre: %d Linear weights optimized (dim_order=[1,0]), "
+        "%d Embedding tables optimized (indirect-access layout), %d other "
+        "params and %d buffers transferred with default layout",
         counts["linear"],
+        counts["embedding"],
         counts["other"],
         counts["buffer"],
     )

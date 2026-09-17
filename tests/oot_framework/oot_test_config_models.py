@@ -62,6 +62,7 @@ class InputInitArgs(BaseModel):
 
     low: int = 0  # randint: lower bound
     high: Optional[int] = None  # randint: upper bound (required)
+    total: Optional[int] = None  # cumsum_offsets: total (required)
     fill_value: Optional[float] = None  # full: fill value (required)
     path: Optional[str] = None  # file: path to .pt / .npy / .safetensors
     key: Optional[str] = None  # file: key within file (dict/.safetensors)
@@ -147,6 +148,8 @@ class InputTensorSpec(BaseModel):
     def validate_cross_fields(self) -> "InputTensorSpec":
         if self.init == "randint" and self.init_args.high is None:
             raise ValueError("init_args.high is required when init: randint")
+        if self.init == "cumsum_offsets" and self.init_args.total is None:
+            raise ValueError("init_args.total is required when init: cumsum_offsets")
         if self.init == "full" and self.init_args.fill_value is None:
             raise ValueError("init_args.fill_value is required when init: full")
         if self.init == "file" and self.init_args.path is None:
@@ -305,6 +308,23 @@ class InputTensorSpec(BaseModel):
             return torch.eye(shape[0], dtype=dtype)
         elif init == "xavier":
             return torch.nn.init.xavier_uniform_(torch.empty(shape, dtype=dtype))
+        elif init == "cumsum_offsets":
+            # Group offsets for torch._grouped_mm: a non-decreasing cumulative
+            # partition of `total` rows over shape[0] groups, ending at `total`.
+            # Seeded here (rather than in the make_tensor block below) so the
+            # partition is identical for the CPU reference and the device run.
+            assert ia.total is not None  # enforced by validate_cross_fields
+            total = ia.total
+            with torch.random.fork_rng(devices=[]):
+                if seed is not None:
+                    torch.manual_seed(int(seed))
+                counts = torch.zeros(shape[0], dtype=dtype)
+                counts.scatter_add_(
+                    0,
+                    torch.randint(0, shape[0], (total,)),
+                    torch.ones(total, dtype=dtype),
+                )
+            return torch.cumsum(counts, dim=0, dtype=dtype)
         elif init == "full":
             return torch.full(shape, ia.fill_value, dtype=dtype)
         elif init == "zeros":
@@ -391,6 +411,16 @@ class InputTensorSpec(BaseModel):
                 t = torch.ones(shape, dtype=dtype)
             elif init == "randint":
                 t = torch.randint(ia.low, ia.high, shape, dtype=dtype)
+            elif init == "cumsum_offsets":
+                assert ia.total is not None  # enforced by validate_cross_fields
+                total = ia.total
+                counts = torch.zeros(shape[0], dtype=dtype)
+                counts.scatter_add_(
+                    0,
+                    torch.randint(0, shape[0], (total,)),
+                    torch.ones(total, dtype=dtype),
+                )
+                t = torch.cumsum(counts, dim=0, dtype=dtype)
             elif init == "arange":
                 t = torch.arange(shape[0], dtype=dtype)
             elif init == "eye":
@@ -534,6 +564,53 @@ class InputArgConfig(BaseModel):
         return self
 
 
+class InputArgModule(BaseModel):
+    """An ``nn.Module`` positional/keyword argument, built from its class + config.
+
+    For wrappers whose ``__init__`` takes a *live module* rather than a config.
+    An out-of-tree adapter may wrap an already-constructed upstream module to
+    adopt its submodules -- e.g. Spyre's ``StandardGQAAttention(attn)`` reuses an
+    HF attention's q/k/v/o projections -- and such a wrapper cannot be built from
+    a config spec alone: the inner module has to be constructed first, and a live
+    ``nn.Module`` is not expressible in YAML. ``py`` is no escape hatch either
+    (``_eval_py_literal`` permits only literals and ``slice(...)``).
+
+    The inner module is built by importing ``module_path`` and calling it with a
+    config resolved exactly like :class:`InputArgConfig` (``model_id`` preferred,
+    ``config_path`` + ``config_kwargs`` as the narrower fallback), plus
+    ``module_kwargs`` (e.g. ``layer_idx``). A module needing no config at all may
+    set neither and pass only ``module_kwargs``.
+
+    Weights are whatever the inner module's own ``__init__`` produces (fresh
+    init): this spec carries *shape*, not values. Put the dimensions the module
+    actually runs with in the config -- for a device that pads a dimension for
+    alignment, that means the padded value, not the checkpoint's.
+    """
+
+    module_path: str  # e.g. "transformers.models.granite...GraniteAttention"
+    config_path: Optional[str] = None
+    config_kwargs: Dict[str, Any] = {}
+    model_id: Optional[str] = None  # HF path/dir for AutoConfig.from_pretrained
+    config_overrides: Dict[str, Any] = {}  # applied via setattr after from_pretrained
+    module_kwargs: Dict[str, Any] = {}  # e.g. {"layer_idx": 0}
+
+    def config_arg(self) -> Optional["InputArgConfig"]:
+        """Return the config spec to build the inner module with, if any.
+
+        Reuses :class:`InputArgConfig` rather than duplicating its two
+        reconstruction strategies, so ``model_id`` / ``config_path`` behave
+        identically here and in a bare config arg.
+        """
+        if not self.model_id and not self.config_path:
+            return None
+        return InputArgConfig(
+            config_path=self.config_path,
+            config_kwargs=self.config_kwargs,
+            model_id=self.model_id,
+            config_overrides=self.config_overrides,
+        )
+
+
 class InputArgCache(BaseModel):
     """A pre-populated KV cache argument (e.g. a decode-step ``past_key_values``).
 
@@ -563,6 +640,7 @@ class InputArgCache(BaseModel):
 InputArg = Union[
     InputArgTensor,
     InputArgTensorList,
+    InputArgModule,
     InputArgConfig,
     InputArgCache,
     InputArgValue,
@@ -583,6 +661,7 @@ def _parse_input_arg(raw: Any) -> InputArg:
         (
             InputArgTensor,
             InputArgTensorList,
+            InputArgModule,
             InputArgConfig,
             InputArgCache,
             InputArgValue,
@@ -611,6 +690,18 @@ def _parse_input_arg(raw: Any) -> InputArg:
             config_path=c.get("config_path"),
             config_kwargs=c.get("config_kwargs", {}) or {},
         )
+    # Checked BEFORE the config keys: a module spec carries "module_path" AND
+    # (usually) "model_id"/"config_path", so the config branch would otherwise
+    # swallow it and build the bare config instead of the module.
+    if "module_path" in keys:
+        return InputArgModule(
+            module_path=raw["module_path"],
+            config_path=raw.get("config_path"),
+            config_kwargs=raw.get("config_kwargs", {}) or {},
+            model_id=raw.get("model_id"),
+            config_overrides=raw.get("config_overrides", {}) or {},
+            module_kwargs=raw.get("module_kwargs", {}) or {},
+        )
     # A config arg is identified by either key: "model_id" (load full config via
     # AutoConfig.from_pretrained — no config_path required) or "config_path"
     # (rebuild from config_kwargs).
@@ -627,7 +718,8 @@ def _parse_input_arg(raw: Any) -> InputArg:
         return InputArgPy(py=raw["py"])
     raise ValueError(
         f"Each args element must contain exactly one of: "
-        f"tensor, tensor_list, config_path, model_id, value, py. Got keys: {keys}"
+        f"tensor, tensor_list, module_path, config_path, model_id, value, py. "
+        f"Got keys: {keys}"
     )
 
 
@@ -664,6 +756,32 @@ def _build_hf_config(arg: "InputArgConfig") -> Any:
         )
     config_cls = getattr(importlib.import_module(module_path), cls_name)
     return config_cls(**arg.config_kwargs)
+
+
+def _build_inner_module(arg: "InputArgModule") -> Any:
+    """Construct the inner ``nn.Module`` described by an :class:`InputArgModule`.
+
+    Shared by the positional (``build_cpu_args``) and keyword
+    (``resolved_kwargs``) resolution paths, mirroring
+    :func:`_build_hf_config`.
+
+    Built on CPU like every other arg; the caller relocates the assembled wrapper
+    to the test device afterwards. The module is left in whatever mode its
+    ``__init__`` chose -- the test harness sets train/eval on the outer wrapper.
+    """
+    import importlib
+
+    mod_path, _, cls_name = arg.module_path.rpartition(".")
+    if not mod_path:
+        raise ValueError(
+            f"Invalid module_path {arg.module_path!r}: expected "
+            f"'package.module.ClassName'"
+        )
+    inner_cls = getattr(importlib.import_module(mod_path), cls_name)
+
+    config_arg = arg.config_arg()
+    ctor_args = [] if config_arg is None else [_build_hf_config(config_arg)]
+    return inner_cls(*ctor_args, **arg.module_kwargs)
 
 
 def _dtypes_from_input_arg(arg: "InputArg") -> Set[torch.dtype]:
@@ -848,6 +966,9 @@ class InputsEdits(BaseModel):
                 ]
                 cpu_args.append(_move_to_test_device(lst, test_device))
 
+            elif isinstance(arg, InputArgModule):
+                cpu_args.append(_build_inner_module(arg))
+
             elif isinstance(arg, InputArgConfig):
                 cpu_args.append(_build_hf_config(arg))
 
@@ -862,6 +983,19 @@ class InputsEdits(BaseModel):
                         f"config so the constructor arg uses 'config_path' + "
                         f"'config_kwargs' instead of a bare '<config:...>' value."
                     )
+                # A dtype recorded as its repr (e.g. 'torch.bfloat16'). Left as
+                # a string it reaches the op as a positional arg and is
+                # misinterpreted -- x.to('torch.bfloat16') parses it as a
+                # DEVICE string and raises. kwargs already resolve dtypes;
+                # positional values get the same treatment. Gated on a known
+                # dtype name so device strings ('cpu', 'cuda:0') and any other
+                # 'torch.'-prefixed value fall through unchanged.
+                if (
+                    isinstance(val, str)
+                    and val.startswith("torch.")
+                    and val.removeprefix("torch.") in _VALID_DTYPE_STRINGS
+                ):
+                    val = _resolve_dtype_str(val)
                 if (
                     test_device is not None
                     and op_name == "torch.to"
@@ -893,6 +1027,29 @@ class InputsEdits(BaseModel):
                 raise ValueError(f"Unknown InputArg type: {type(arg)}")
 
         return cpu_args
+
+    def resolved_device_args(
+        self,
+        *,
+        test_device: Optional[torch.device],
+        op_name: str = "",
+    ) -> Dict[int, Any]:
+        """Return {arg_index: test_device} for positional device args.
+
+        ``torch.to("cuda:0")`` names its destination positionally, so it takes
+        the same substitution ``resolved_kwargs`` rule 2 applies to a ``device``
+        kwarg. Only indices holding a device are returned, so callers can overlay
+        them onto CPU-built args without disturbing other values.
+        """
+        out: Dict[int, Any] = {}
+        if test_device is None or op_name != "torch.to":
+            return out
+        for i, raw in enumerate(self.args):
+            arg = _parse_input_arg(raw) if isinstance(raw, dict) else raw
+            val = getattr(arg, "value", None)
+            if isinstance(val, str) and "cuda" in val:
+                out[i] = test_device
+        return out
 
     def resolved_kwargs(
         self,
@@ -943,7 +1100,15 @@ class InputsEdits(BaseModel):
 
         # Tensor-spec dicts carry exactly one of these keys; anything else is a
         # plain scalar/dtype/device value handled by the string branch below.
-        _SPEC_KEYS = {"tensor", "tensor_list", "config_path", "model_id", "cache", "py"}
+        _SPEC_KEYS = {
+            "tensor",
+            "tensor_list",
+            "module_path",
+            "config_path",
+            "model_id",
+            "cache",
+            "py",
+        }
 
         out: Dict[str, Any] = {}
         for i, (k, v) in enumerate(self.kwargs.items()):
@@ -965,6 +1130,13 @@ class InputsEdits(BaseModel):
                         for j, spec in enumerate(arg.tensor_list)
                     ]
                     out[k] = _move_to_test_device(lst, test_device)
+                elif isinstance(arg, InputArgModule):
+                    # Left on CPU: _move_to_test_device only relocates tensors
+                    # (an nn.Module passes through untouched), and the wrapper
+                    # that adopts this module is itself moved to the test device
+                    # by the harness, which carries the adopted submodules with
+                    # it.
+                    out[k] = _build_inner_module(arg)
                 elif isinstance(arg, InputArgConfig):
                     out[k] = _build_hf_config(arg)
                 elif isinstance(arg, InputArgCache):
@@ -1029,6 +1201,24 @@ class ModulesNamedItem(BaseModel):
     name: str
     module_path: Optional[str] = None  # Full import path (e.g., "torch.nn.Linear")
     description: Optional[str] = None
+
+    # When true, a device-side instance of this module has its parameters and
+    # buffers REALLOCATED with the device layout the production path uses,
+    # instead of a plain ``.to(device)``.
+    #
+    # Distinct from ``InputTensorSpec.device_layout``, which lays out a single
+    # *input* tensor from an explicit device_size/stride_map: this flag concerns
+    # the module's own *parameters*, whose layout the production code derives per
+    # tensor (on Spyre: row-major [1, 0] dim_order on 2-D matmul weights,
+    # embeddings excluded) rather than spelling out in YAML. Those rules live in
+    # the device backend's own code -- on Spyre,
+    # ``hf_adapters.hf_common.apply_spyre_layout_to_module`` -- so what the test
+    # allocates cannot drift from what production allocates.
+    #
+    # Consumed by the out-of-tree custom module tests; ignored on devices with no
+    # layout concept (e.g. CPU).
+    apply_device_layout: bool = False
+
     sample_inputs_func: InputsEdits = InputsEdits()  # Legacy: forward inputs only
     constructor_inputs: Optional[InputsEdits] = None  # New: explicit constructor inputs
     forward_inputs: Optional[Union[InputsEdits, List[InputsEdits]]] = (
@@ -1357,6 +1547,14 @@ class FileEntry(BaseModel):
 
     path: str
     unlisted_test_mode: str = MODE_XFAIL
+    # Not a real YAML field -- never set by a hand-written config. Populated
+    # by merge_yaml_configs() with the origin config's test_suite_config.labels
+    # so per-file labels survive a multi-config merge (which drops the
+    # top-level labels field, since it can't represent per-file provenance
+    # once files from different configs are combined). See
+    # OOTTestBase._load_test_suite_config(), which prefers this over
+    # test_suite_config.labels when non-empty.
+    labels: List[str] = []
     tests: List[TestEntry] = []
 
     @field_validator("unlisted_test_mode")
@@ -1568,7 +1766,7 @@ class TestsBlock(BaseModel):
 
     files: List[FileEntry]
     global_config: GlobalConfig = GlobalConfig()
-    labels: List[str] = ["full"]
+    labels: List[str] = []
 
     @model_validator(mode="before")
     @classmethod

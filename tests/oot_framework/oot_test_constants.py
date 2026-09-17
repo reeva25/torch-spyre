@@ -12,7 +12,7 @@ import torch
 
 DEFAULT_FLOATING_PRECISION: float = 1e-3
 
-_DYNAMIC_TAG_PREFIXES = ("op__", "dtype__", "module__", "platform__")
+_DYNAMIC_TAG_PREFIXES = ("op__", "dtype__", "module__", "platform__", "testtype__")
 
 MODE_MANDATORY_SUCCESS = "mandatory_success"
 MODE_XFAIL = "xfail"
@@ -72,6 +72,7 @@ _VALID_INIT_STRATEGIES = {
     "eye",
     "full",
     "file",
+    "cumsum_offsets",
 }
 
 _VALID_TEST_MODES = {MODE_MANDATORY_SUCCESS, MODE_XFAIL, MODE_XFAIL_STRICT, MODE_SKIP}
