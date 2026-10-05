@@ -1,0 +1,245 @@
+
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Compile Time on the Spyre Stack</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    color: #1f2328;
+    background: #ffffff;
+    padding: 40px 24px;
+  }
+  .page { max-width: 760px; margin: 0 auto; }
+
+  h1 {
+    font-size: 22px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .subtitle {
+    font-size: 13px;
+    color: #57606a;
+    margin-bottom: 24px;
+  }
+
+  .intro {
+    margin-bottom: 28px;
+    color: #1f2328;
+  }
+
+  h2 {
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 12px;
+    margin-top: 32px;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+  thead tr {
+    background: #f7f8fa;
+  }
+  th {
+    text-align: left;
+    padding: 8px 12px;
+    border: 1px solid #e5e7eb;
+    font-weight: 600;
+    color: #57606a;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  td {
+    padding: 8px 12px;
+    border: 1px solid #e5e7eb;
+    vertical-align: top;
+  }
+  tbody tr:nth-child(even) { background: #f7f8fa; }
+
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .badge-today    { background: #fde8e8; color: #9e1c1c; }
+  .badge-beta     { background: #e6f4ea; color: #1a6b34; }
+  .badge-stack    { background: #ede9f9; color: #4a2d8a; }
+
+  .lever {
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+  .lever-header {
+    background: #f7f8fa;
+    padding: 10px 16px;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  .lever-header h3 {
+    font-size: 14px;
+    font-weight: 700;
+    margin: 0;
+  }
+  .lever-target {
+    font-size: 12px;
+    color: #3b82d4;
+    font-weight: 500;
+    margin-top: 2px;
+  }
+  .lever-body {
+    padding: 14px 16px;
+  }
+  .lever-body p {
+    margin-bottom: 10px;
+  }
+  .lever-body p:last-child {
+    margin-bottom: 0;
+  }
+  .risks-label {
+    font-weight: 600;
+    color: #57606a;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-top: 12px;
+    margin-bottom: 4px;
+    display: block;
+  }
+  .risks-text {
+    color: #57606a;
+    font-size: 13px;
+  }
+
+  code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 12px;
+    background: #f0f2f5;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #1f2328;
+  }
+
+  footer {
+    margin-top: 48px;
+    padding-top: 16px;
+    border-top: 1px solid #e5e7eb;
+    text-align: center;
+    font-size: 12px;
+    color: #57606a;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <h1>Compile Time on the Spyre Stack</h1>
+  <p class="subtitle">Technical roadmap for reducing compile time. Four levers, with targets and risks. Implementation is left to the owning teams.</p>
+
+  <p class="intro">First compile of a large-context model takes about one hour at a 32k sequence length. This cost is paid on first deployment of each model at each shape, and again after any stack upgrade. Most of the hour is the per-SDSC <code>dbo-opt</code> invocations; the remainder is dynamo capture and inductor lowering, where the CP-SAT layout solver is the largest single term.</p>
+
+  <h2>Summary</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Path</th>
+        <th>Cost</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Cold compile, 32k sequence length</td>
+        <td>~1 hour</td>
+        <td><span class="badge badge-today">today</span></td>
+      </tr>
+      <tr>
+        <td>Warm compile, unchanged model and shapes</td>
+        <td>a few seconds (dynamo only)</td>
+        <td><span class="badge badge-beta">beta/GA</span></td>
+      </tr>
+      <tr>
+        <td>Incremental recompile, one block changed</td>
+        <td>warm cost + that block's kernels</td>
+        <td><span class="badge badge-beta">beta/GA</span></td>
+      </tr>
+      <tr>
+        <td>Optimized cold compile, parallel dbo-opt + solver hints</td>
+        <td>reduced backend and lowering terms</td>
+        <td><span class="badge badge-beta">beta/GA</span></td>
+      </tr>
+      <tr>
+        <td>Symbolic-loop compile, one kernel per shape range</td>
+        <td>one cold compile instead of N</td>
+        <td><span class="badge badge-stack">stack update</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Levers</h2>
+
+  <div class="lever">
+    <div class="lever-header">
+      <h3>Lever 1 — Warm compile</h3>
+      <div class="lever-target">Target: a repeat compile of an unchanged model at unchanged shapes costs a few seconds.</div>
+    </div>
+    <div class="lever-body">
+      <p>Compiled kernels are cacheable artifacts, so a repeat compile can skip inductor lowering, bundle emission, and <code>dbo-opt</code>, paying dynamo cost only. Two lookup tiers are involved: a graph-level entry keyed on the FX graph and shapes, which is what produces the few-seconds figure, and per-SDSC entries keyed on the emitted SDSC JSON, which is what Lever 2 builds on. This is distinct from today's <code>config.sdsc_cache</code>, which deduplicates SDSC JSON within a single bundle and does not survive the process.</p>
+      <span class="risks-label">Risks</span>
+      <p class="risks-text">A stale hit returns a wrong kernel silently rather than failing, so the key must cover SDSC content, core count (<code>SENCORES</code>), deeptools build identity, and data format, and needs comprehensive test coverage against stale matching. Because build identity is part of the key, any stack upgrade invalidates every entry, so this lever applies to steady-state operation only.</p>
+    </div>
+  </div>
+
+  <div class="lever">
+    <div class="lever-header">
+      <h3>Lever 2 — Incremental recompile</h3>
+      <div class="lever-target">Target: an edit that changes one block recompiles only that block's kernels.</div>
+    </div>
+    <div class="lever-body">
+      <p>Per-SDSC cache granularity confines invalidation to the kernels an edit actually changes. Replacing layernorm with rmsnorm leaves every attention kernel bit-identical and recompiles only the norm kernels. Small shape changes behave the same way: changing a sequence length re-tiles attention but can leave elementwise and norm kernels unchanged, and changing a hidden dimension does the reverse.</p>
+      <span class="risks-label">Risks</span>
+      <p class="risks-text">Granularity is the whole design decision — bundle-level keying is the simpler implementation and almost never hits during iteration. Compiler-side changes invalidate every entry regardless of granularity, so this lever covers model-side change only.</p>
+    </div>
+  </div>
+
+  <div class="lever">
+    <div class="lever-header">
+      <h3>Lever 3 — Optimized cold compile</h3>
+      <div class="lever-target">Target: reduce the cold-compile hour without changing what gets compiled.</div>
+    </div>
+    <div class="lever-body">
+      <p>Two independent terms. The <code>dbo-opt</code> invocations are independent per SDSC and currently run serially, so distributing them across host cores reduces the backend term by close to the available parallelism. On the frontend, the CP-SAT layout solver (<code>CpSatLayoutSolver</code>, joint core-division and LX placement, default since <code>config.layout_solver</code> flipped from greedy) dominates lowering time; supplying it hints from a prior solve or from analytic heuristics reduces convergence time.</p>
+      <span class="risks-label">Risks</span>
+      <p class="risks-text">Parallelism is bounded by <code>dbo-opt</code> peak memory times concurrency and by the longest single SDSC. Solver hints can steer CP-SAT to a worse layout than a full solve, so device time must be measured alongside convergence time rather than assumed unchanged.</p>
+    </div>
+  </div>
+
+  <div class="lever">
+    <div class="lever-header">
+      <h3>Lever 4 — Symbolic-loop compile</h3>
+      <div class="lever-target">Target: one compiled kernel covers a shape range instead of one compile per shape.</div>
+    </div>
+    <div class="lever-body">
+      <p>Covering k sequence lengths currently requires k static compilations. With symbolic shapes, loop trip counts resolve from a runtime argument instead of being fixed at compile time. This requires inductor higher-order operators (HOP) to preserve loop structure through lowering rather than specializing at a fixed trip count, and symbolic loop counts in deeptools to emit code that reads them at launch.</p>
+      <p>Part of the interface exists: <code>mark_dynamic</code> symbols already emit <code>!sdscbundle.input_arg&lt;index, granularity=G, max_value=M&gt;</code> parameters and <code>sdsc_execute</code> carries a <code>symbol_ids</code> list, while the spyre-comms static path emits the <code>symbolicDimInfo_</code> / <code>coreletSplit_</code> / <code>rowSplit_</code> group empty pending dynamic shapes in <code>SDSCSpec</code>.</p>
+      <span class="risks-label">Risks</span>
+      <p class="risks-text">A kernel compiled for a range cannot make shape-specific tiling, core-division, or LX residency choices, so expect device-time regression against a static kernel at any single shape in the range. Frontend HOP and backend symbolic loops must both land before either delivers value.</p>
+    </div>
+  </div>
+
+</div>
+<footer>Made with IBM Bob</footer>
+</body>
+</html>
