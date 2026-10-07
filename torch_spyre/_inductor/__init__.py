@@ -150,6 +150,10 @@ def enable_spyre_compile_fx_wrapper():
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
             uses_spyre = _uses_spyre(gm, example_inputs)
+            if uses_spyre:
+                from .dynamic_guards import check_undeclared_dynamic_dims
+
+                check_undeclared_dynamic_dims(gm, example_inputs)
 
             try:
                 if uses_spyre:
