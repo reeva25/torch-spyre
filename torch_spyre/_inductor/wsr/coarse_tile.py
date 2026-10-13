@@ -7398,9 +7398,7 @@ def _index_already_at_new_scale(
     a dim's stride), which is a no-op either way.
     """
     try:
-        atoms, _offset = decompose_index_for_tiling(
-            index, {sym: 1 for sym in loop_syms}
-        )
+        atoms, _offset = decompose_index_for_tiling(index, dict.fromkeys(loop_syms, 1))
     except Unsupported:
         return False
     if not atoms:

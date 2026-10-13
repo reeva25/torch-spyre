@@ -38,7 +38,7 @@ def _mixed_radix_digits(expr, var, var_range, mods):
     this recognition deliberately strict preserves rejection of ambiguous
     combinations such as ``Mod(x, 4) + Mod(x, 6)``.
     """
-    term = expr.xreplace({s: 0 for s in expr.free_symbols - {var}})
+    term = expr.xreplace(dict.fromkeys(expr.free_symbols - {var}, 0))
     var_terms = [addend for addend in sympy.Add.make_args(term) if addend.has(var)]
     if len(var_terms) != len(mods):
         return None
