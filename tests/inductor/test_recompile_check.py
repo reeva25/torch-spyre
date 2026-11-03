@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The recompile check: user recompiles are reported, torch-spyre's are not.
+"""The recompile check: recompiles that break a declared range are reported.
 
-The CPU tests compile with ``backend="eager"`` and run anywhere. The device
-tests need a Spyre device and the ``dynamic=`` reservation of #5179.
+By default only a recompile whose input has one of its declared sizes is
+reported; ``all`` mode reports every recompile of user code. torch-spyre's own
+compiles are never reported. The CPU tests compile with ``backend="eager"`` and
+stand in for a declaration by patching ``_declaration_of``. The device tests
+need a Spyre device and the ``dynamic=`` reservation of #5179.
 """
 
 import os
@@ -35,9 +38,11 @@ from torch_spyre._inductor.recompile_check import (
     install_recompile_check,
     reset_compile_ledger,
 )
+from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre.constants import DEVICE_NAME
 
 COLS = 8
+SPEC = {0: {"min": 128, "max": 512, "granularity": 64}}
 
 
 def _reports(caught):
@@ -51,6 +56,19 @@ def _run(fn, *inputs):
         for x in inputs:
             fn(x)
     return _reports(caught)
+
+
+def _mode(mode):
+    return mock.patch.dict(os.environ, {MODE_ENV: mode})
+
+
+def _declared_on_cpu():
+    """Treat every 2-D CPU tensor as declared with ``SPEC``."""
+    return mock.patch.object(
+        recompile_check,
+        "_declaration_of",
+        lambda t: SPEC if t.dim() == 2 else None,
+    )
 
 
 class _Base(unittest.TestCase):
@@ -69,33 +87,56 @@ class TestRecompileCheckCPU(_Base):
 
         return block
 
-    def test_recompile_warns_by_default_with_the_reason(self):
-        reports = _run(self._block(), torch.randn(128, COLS), torch.randn(192, COLS))
+    def _sizes(self, *sizes):
+        return [torch.randn(n, COLS) for n in sizes]
+
+    def test_undeclared_recompile_is_silent_by_default(self):
+        self.assertEqual(_run(self._block(), *self._sizes(128, 192)), [])
+
+    def test_declared_recompile_at_a_promised_size_warns(self):
+        with _declared_on_cpu():
+            reports = _run(self._block(), *self._sizes(128, 192))
+        self.assertEqual(len(reports), 1)
+        self.assertIn("recompiled (compile 2)", reports[0])
+        self.assertIn("Declared range broken: input 'x' dim 0 is 192", reports[0])
+        self.assertIn("expected 128, actual 192", reports[0])
+
+    def test_declared_recompile_outside_promised_sizes_is_silent(self):
+        # 100 is not one of the declared sizes; the declaration refuses it
+        # elsewhere, and it is not a broken promise.
+        with _declared_on_cpu():
+            self.assertEqual(_run(self._block(), *self._sizes(128, 100)), [])
+
+    def test_error_mode_stops_a_broken_promise(self):
+        block = self._block()
+        with _declared_on_cpu(), _mode("error"):
+            block(torch.randn(128, COLS))
+            with self.assertRaisesRegex(RecompileError, "Declared range broken"):
+                block(torch.randn(192, COLS))
+
+    def test_error_mode_lets_undeclared_recompiles_through(self):
+        with _mode("error"):
+            self.assertEqual(_run(self._block(), *self._sizes(128, 192)), [])
+
+    def test_all_mode_reports_any_recompile_with_the_reason(self):
+        with _mode("all"):
+            reports = _run(self._block(), *self._sizes(128, 192))
         self.assertEqual(len(reports), 1)
         self.assertIn("block", reports[0])
         self.assertIn("recompiled (compile 2)", reports[0])
         self.assertIn("expected 128, actual 192", reports[0])
+        self.assertNotIn("Declared range broken", reports[0])
 
     def test_cached_call_is_not_reported(self):
-        reports = _run(self._block(), torch.randn(128, COLS), torch.randn(128, COLS))
-        self.assertEqual(reports, [])
-
-    def test_error_mode_stops_the_recompile(self):
-        block = self._block()
-        block(torch.randn(128, COLS))
-        with mock.patch.dict(os.environ, {MODE_ENV: "error"}):
-            with self.assertRaisesRegex(RecompileError, "recompiled"):
-                block(torch.randn(192, COLS))
+        with _mode("all"):
+            self.assertEqual(_run(self._block(), *self._sizes(128, 128)), [])
 
     def test_off_mode_reports_nothing(self):
-        with mock.patch.dict(os.environ, {MODE_ENV: "off"}):
-            reports = _run(
-                self._block(), torch.randn(128, COLS), torch.randn(192, COLS)
-            )
-        self.assertEqual(reports, [])
+        with _declared_on_cpu(), _mode("off"):
+            self.assertEqual(_run(self._block(), *self._sizes(128, 192)), [])
 
     def test_ledger_counts_and_times_user_compiles(self):
-        _run(self._block(), torch.randn(128, COLS), torch.randn(192, COLS))
+        _run(self._block(), *self._sizes(128, 192))
         rows = [row for name, row in compile_ledger().items() if "block" in name]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["compiles"], 2)
@@ -122,7 +163,8 @@ class TestRecompileCheckCPU(_Base):
             torch._dynamo.graph_break()
             return y * 3
 
-        reports = _run(broken, torch.randn(128, COLS), torch.randn(192, COLS))
+        with _mode("all"):
+            reports = _run(broken, *self._sizes(128, 192))
         self.assertEqual(len(reports), 2)
         self.assertTrue(any("resume_in_broken" in r for r in reports))
 
@@ -147,43 +189,78 @@ class TestRecompileCheckCPU(_Base):
         def calls_helper(x):
             return spyre_helper(x.relu()) * 3
 
-        reports = _run(calls_helper, torch.randn(128, COLS), torch.randn(192, COLS))
+        with _mode("all"):
+            reports = _run(calls_helper, *self._sizes(128, 192))
         self.assertEqual(len(reports), 2)
         self.assertFalse(any("_test_helper.py" in r for r in reports))
         self.assertTrue(any("resume_in_calls_helper" in r for r in reports))
 
 
+def _region(branch):
+    """A tiled region over a declared dim; ``branch`` adds a size branch."""
+
+    def region(x):
+        rows = x.shape[0]
+        torch._check(rows >= 128)
+        torch._check(rows <= 512)
+        torch._check(rows % 64 == 0)
+        scale = (2.0 if rows > 256 else 1.0) if branch else 1.0
+
+        def body(_carry, tiles):
+            (tile,) = tiles
+            return None, (tile * scale).relu()
+
+        _carry, out = for_each_tile(body, (x,), dims=(0,), tile_size=64, out_dim=0)
+        return out
+
+    return region
+
+
+def _declared(*sizes):
+    return [
+        torch.randn(n, 64, dtype=torch.float16).to(DEVICE_NAME, dynamic=SPEC)
+        for n in sizes
+    ]
+
+
 class TestRecompileCheckOnDevice(_Base):
+    def test_declared_region_serves_every_size_without_a_report(self):
+        # The promise kept: one program for 128, 192, 256 and 320.
+        region = torch.compile(_region(branch=False), fullgraph=True)
+        self.assertEqual(_run(region, *_declared(128, 192, 256, 320)), [])
+
+    def test_size_branch_in_a_declared_region_is_reported(self):
+        # rows > 256 splits the range, so 320 recompiles: a broken promise.
+        region = torch.compile(_region(branch=True), fullgraph=True)
+        reports = _run(region, *_declared(128, 320))
+        self.assertEqual(len(reports), 1)
+        self.assertIn("Declared range broken", reports[0])
+        self.assertIn("is 320", reports[0])
+
     def test_eager_ops_at_new_sizes_are_not_reported(self):
         # Each eager op is a small per-op compile that recompiles per size by
-        # design. Even in error mode they must keep working.
-        with mock.patch.dict(os.environ, {MODE_ENV: "error"}):
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                for n in (128, 192):
-                    x = torch.randn(n, 64, dtype=torch.float16).to(DEVICE_NAME)
-                    x.clone()
-                    x + x
+        # design. Even in all mode they must not be reported.
+        with _mode("all"), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for n in (128, 192):
+                x = torch.randn(n, 64, dtype=torch.float16).to(DEVICE_NAME)
+                x.clone()
+                x + x
         self.assertEqual(_reports(caught), [])
 
-    def test_lost_declaration_recompile_is_reported(self):
+    def test_lost_declaration_recompile_is_reported_in_all_mode(self):
         # A view drops the declaration, so the next block sees an ordinary
         # tensor. Under dynamic=None, the supported setting, its second size
-        # is an automatic-dynamic recompile and must be reported. Spyre may
-        # then refuse that compile (an unbounded size outside a loop); the
-        # report is made before the compile either way.
+        # is an automatic-dynamic recompile. Only all mode reports it, since
+        # the input no longer carries a declaration. Spyre may then refuse
+        # that compile (an unbounded size outside a loop); the report is made
+        # before the compile either way.
         @torch.compile(dynamic=None)
         def block(h):
             return h * 2.0
 
-        spec = {0: {"min": 128, "max": 512, "granularity": 64}}
-        first, second = (
-            torch.randn(n, 64, dtype=torch.float16)
-            .to(DEVICE_NAME, dynamic=spec)
-            .view(-1, 64)
-            for n in (128, 192)
-        )
-        with warnings.catch_warnings(record=True) as caught:
+        first, second = (x.view(-1, 64) for x in _declared(128, 192))
+        with _mode("all"), warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             block(first)
             try:
@@ -198,7 +275,7 @@ class TestRecompileCheckOnDevice(_Base):
     def test_torch_spyre_internal_compiles_are_not_reported(self):
         # Custom ops and decompositions that torch-spyre compiles behind the
         # user's back, each at two sizes. They recompile per size by design,
-        # so even error mode must let them through.
+        # so even all mode must not report them.
         w = torch.ones(64, dtype=torch.float16).to(DEVICE_NAME)
         paths = {
             "copy_from_d2d": lambda x: torch.empty_like(x).copy_(x),
@@ -214,13 +291,13 @@ class TestRecompileCheckOnDevice(_Base):
                 ]
                 torch._dynamo.reset()
                 try:
-                    with mock.patch.dict(os.environ, {MODE_ENV: "off"}):
+                    with _mode("off"):
                         for x in xs:
                             op(x)
                 except Exception as e:  # noqa: BLE001
                     self.skipTest(f"{name} does not run here: {type(e).__name__}")
                 torch._dynamo.reset()
-                with mock.patch.dict(os.environ, {MODE_ENV: "error"}):
+                with _mode("all"):
                     reports = _run(op, *xs)
                 self.assertEqual(reports, [])
 

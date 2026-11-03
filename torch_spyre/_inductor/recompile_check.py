@@ -12,20 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Report recompiles of user code, and keep a compile ledger.
+"""Report recompiles that break a declared size range, and keep a compile ledger.
 
-After warm-up, every call to a compiled function should reuse a program. A
-recompile means something split it: a size branch, a declaration lost through
-``clone``/``view``/a graph break, or a guard the narrowing check could not see.
-This hook wraps the callback Dynamo builds for every cache miss, so it sees each
-compile, and reports the ones that are recompiles of user code.
+A declaration ``x.to("spyre", dynamic={0: {"min", "max", "granularity"}})``
+promises one program for every size ``min, min + granularity, ..., max``. A
+recompile while such an input has one of those sizes breaks the promise: a size
+branch, a guard the narrowing check could not see, or a guard it only warned
+about. This hook wraps the callback Dynamo builds for every cache miss, so it
+sees each compile, and reports those recompiles.
 
 torch-spyre's own per-op eager programs (``torch_spyre/ops/eager.py``) and
 PyTorch's internals recompile per size by design. Their code lives inside the
 torch or torch-spyre package, so they are recognised by file and ignored.
 
-``TORCH_SPYRE_RECOMPILE_CHECK`` sets what a recompile does: ``warn`` (default),
-``error``, or ``off``. The ledger records every user compile whatever the mode.
+``TORCH_SPYRE_RECOMPILE_CHECK`` sets the mode:
+
+- ``warn`` (default): warn on a recompile that breaks a declared range.
+- ``error``: stop such a recompile.
+- ``all``: warn on every recompile of user code, declared or not. This also
+  shows a declaration lost through ``clone``/``view``/a graph break.
+- ``off``: report nothing.
+
+The ledger records every user compile whatever the mode.
 """
 
 import os
@@ -35,7 +43,7 @@ import warnings
 import torch
 
 MODE_ENV = "TORCH_SPYRE_RECOMPILE_CHECK"
-_MODES = ("warn", "error", "off")
+_MODES = ("warn", "error", "all", "off")
 _DEFAULT_MODE = "warn"
 
 _TORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__)) + os.sep
@@ -46,7 +54,7 @@ _ledger = {}
 
 
 class RecompileError(RuntimeError):
-    """User code recompiled, in ``error`` mode."""
+    """A recompile broke a declared size range, in ``error`` mode."""
 
 
 class RecompileWarning(UserWarning):
@@ -63,6 +71,39 @@ def _mode():
 def _is_internal(filename):
     path = os.path.abspath(filename)
     return path.startswith(_TORCH_DIR) or path.startswith(_SPYRE_DIR)
+
+
+def _declaration_of(tensor):
+    """The tensor's ``{dim: {min, max, granularity}}`` declaration, or None."""
+    from torch_spyre import _C
+
+    return _C.get_reserved_dims(tensor)
+
+
+def _broken_promise(frame):
+    """Describe the first input whose size is one it was declared to serve.
+
+    Returns None when no input is declared, or every declared input has a size
+    outside its promised list (the declaration refuses those separately).
+    """
+    for arg, value in frame.f_locals.items():
+        tensors = value if isinstance(value, (list, tuple)) else (value,)
+        for t in tensors:
+            if not isinstance(t, torch.Tensor):
+                continue
+            try:
+                decl = _declaration_of(t)
+            except Exception:  # noqa: BLE001  never let the check break a call
+                return None
+            for d, spec in (decl or {}).items():
+                legal = range(spec["min"], spec["max"] + 1, spec["granularity"])
+                if t.shape[d] in legal:
+                    return (
+                        f"input '{arg}' dim {d} is {t.shape[d]}, one of its "
+                        f"declared sizes {spec['min']}..{spec['max']} "
+                        f"step {spec['granularity']}"
+                    )
+    return None
 
 
 def _reasons(entries, frame, callback):
@@ -90,30 +131,39 @@ def reset_compile_ledger():
     _ledger.clear()
 
 
-def _wrap(callback):
+def _report(frame, callback, code, mode):
+    """The text to report for this miss, or None when there is nothing to say."""
     from torch._C._dynamo.eval_frame import _debug_get_cache_entry_list
 
+    entries = _debug_get_cache_entry_list(code)
+    if not entries:  # a first compile is normal
+        return None
+    broken = _broken_promise(frame)
+    if broken is None and mode != "all":
+        return None
+    name = f"{code.co_name} ({code.co_filename}:{code.co_firstlineno})"
+    reasons = "; ".join(_reasons(entries, frame, callback)) or "unknown"
+    why = f" Declared range broken: {broken}." if broken else ""
+    return (
+        f"Warning! {name} recompiled (compile {len(entries) + 1}).{why} "
+        f"Reason: {reasons}"
+    )
+
+
+def _wrap(callback):
     def wrapped(frame, *args, **kwargs):
         code = frame.f_code
         if _is_internal(code.co_filename):
             return callback(frame, *args, **kwargs)
 
-        name = f"{code.co_name} ({code.co_filename}:{code.co_firstlineno})"
-        report = None
         mode = _mode()
-        if mode != "off":
-            entries = _debug_get_cache_entry_list(code)
-            if entries:
-                reasons = "; ".join(_reasons(entries, frame, callback)) or "unknown"
-                report = (
-                    f"Warning! {name} recompiled (compile {len(entries) + 1}). "
-                    f"Reason: {reasons}"
-                )
+        report = None if mode == "off" else _report(frame, callback, code, mode)
         if report and mode == "error":
             raise RecompileError(report)
         if report:
             warnings.warn(report, RecompileWarning, stacklevel=2)
 
+        name = f"{code.co_name} ({code.co_filename}:{code.co_firstlineno})"
         start = time.perf_counter()
         try:
             return callback(frame, *args, **kwargs)
