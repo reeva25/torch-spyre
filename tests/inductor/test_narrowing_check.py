@@ -75,6 +75,15 @@ class TestHelpers(unittest.TestCase):
     def test_unevaluable_guard_is_skipped_not_raised(self):
         self.assertIsNone(rejected_sizes(_UnevaluableGuard(self.s), self.sym_legal))
 
+    def test_build_without_reservation_finds_no_declarations(self):
+        # Without the dynamic= reservation (#5179) there is no
+        # get_reserved_dims; the check must find nothing, never crash.
+        from torch_spyre import _C
+        from torch_spyre._inductor.narrowing_check import declared_symbols
+
+        with mock.patch.object(_C, "get_reserved_dims", None, create=True):
+            self.assertEqual(declared_symbols(None, []), {})
+
 
 def _make_region(min_rows, narrowing=None):
     """A tiled region; ``narrowing`` picks the size-dependent code to add."""

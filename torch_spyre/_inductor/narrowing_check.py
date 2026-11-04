@@ -61,12 +61,16 @@ def declared_symbols(gm, example_inputs):
     """
     from torch_spyre import _C
 
+    get_reserved_dims = getattr(_C, "get_reserved_dims", None)
+    if get_reserved_dims is None:  # no dynamic= reservation in this build
+        return {}
+
     placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
     result = {}
     for node, t in zip(placeholders, example_inputs):
         if not isinstance(t, torch.Tensor):
             continue
-        decl = _C.get_reserved_dims(t)
+        decl = get_reserved_dims(t)
         fake = node.meta.get("example_value")
         if not decl or fake is None:
             continue
