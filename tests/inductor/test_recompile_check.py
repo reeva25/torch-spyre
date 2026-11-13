@@ -144,6 +144,26 @@ class TestRecompileCheckCPU(_Base):
         self.assertEqual(rows[0]["compiles"], 2)
         self.assertGreater(rows[0]["seconds"], 0.0)
 
+    def test_unknown_mode_falls_back_to_warn(self):
+        # A bad value must not fail a compile: it is logged, and warn is used.
+        with (
+            _mode("not-a-mode"),
+            self.assertLogs(recompile_check.logger.name, level="WARNING") as log,
+        ):
+            self.assertEqual(recompile_check._mode(), "warn")
+        self.assertIn("not-a-mode", log.output[0])
+
+    def test_cpu_tensor_never_reaches_the_runtime(self):
+        # Only a Spyre tensor can be declared, so a CPU tensor is answered
+        # without calling get_reserved_dims.
+        from torch_spyre import _C
+
+        with mock.patch.object(
+            _C, "get_reserved_dims", side_effect=AssertionError("called")
+        ) as reader:
+            self.assertIsNone(recompile_check._declaration_of(torch.randn(4, COLS)))
+        reader.assert_not_called()
+
     def test_torch_and_torch_spyre_files_are_internal(self):
         eager_py = os.path.join(recompile_check._SPYRE_DIR, "ops", "eager.py")
         torch_py = os.path.join(recompile_check._TORCH_DIR, "_compile.py")
@@ -345,13 +365,6 @@ class TestRecompileCheckOnDevice(_Base):
                     torch.randn(n, 64, dtype=torch.float16).to(DEVICE_NAME)
                     for n in (128, 192)
                 ]
-                torch._dynamo.reset()
-                try:
-                    with _mode("off"):
-                        for x in xs:
-                            op(x)
-                except Exception as e:  # noqa: BLE001
-                    self.skipTest(f"{name} does not run here: {type(e).__name__}")
                 torch._dynamo.reset()
                 with _mode("all"):
                     reports = _run(op, *xs)
