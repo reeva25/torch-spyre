@@ -654,12 +654,6 @@ class TestNegativeScalarOperations:
                 "x * 1e10 in FP16 returns NaN instead of inf for inputs of magnitude "
                 "2 or more (#5365)",
             )
-        elif expected_behavior == "overflow_or_large" and execution_mode == "compiled":
-            strict_xfail(
-                request,
-                torch._inductor.exc.InductorError,
-                "Cannot resolve target for 'index_expr' (#4502)",
-            )
 
         if expected_behavior == "underflow_close_to_input":
 

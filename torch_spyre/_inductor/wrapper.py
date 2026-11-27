@@ -121,6 +121,8 @@ class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
 
     def generate_const_tensor_fallback(self, node):
         value = node.constant_args[0]
+        if isinstance(value, sympy.Expr) and not value.is_number:
+            value = self.codegen_python_sizevar(value)
         dtype = node.layout.dtype
         device = node.layout.device
         self.writeline(

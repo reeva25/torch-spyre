@@ -2484,6 +2484,58 @@ class TestASymbolicTripCountRunsAtEverySize(_DynamoResetTestCase):
         self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
 
+def _length_tiled_sum_and_mean_fn(x: torch.Tensor):
+    """Sum over a varying length, then divide by the length after the loop."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows = x.shape[0]
+    torch._check(rows >= 128)
+    torch._check(rows <= 512)
+    torch._check(rows % 64 == 0)
+
+    def body(acc, tiles):
+        (tile,) = tiles
+        return acc + tile.sum(dim=0, keepdim=True), None
+
+    acc, _ = for_each_tile(
+        body, (x,), dims=(0,), tile_size=64, init=x.new_zeros((1, x.shape[1]))
+    )
+    return acc, acc / rows
+
+
+class TestDivideByADeclaredLength(_DynamoResetTestCase):
+    """A value divided by the declared length, with one graph for every size.
+
+    ``acc / rows`` reaches split_multi_ops as ``index_expr(s, fp16)`` fused
+    with the divide. The pass now materializes the length as a constant
+    buffer that the wrapper fills on the host at each call. The mean is
+    checked against the device's own sum divided by the length, so this
+    checks the divisor and not the rounding of the sum.
+    """
+
+    SPEC = {"min": 128, "max": 512, "granularity": 64}
+
+    def test_one_graph_divides_by_the_size_of_each_call(self):
+        from torch._dynamo.utils import counters
+
+        counters.clear()
+        torch.manual_seed(0)
+        x = torch.randn(512, 64, dtype=torch.float16)
+        y = x.to(DEVICE_NAME, dynamic={0: self.SPEC})
+        compiled = torch.compile(_length_tiled_sum_and_mean_fn, fullgraph=True)
+
+        for rows in (256, 128, 512, 448, 192):
+            y.resize_((rows, 64))
+            acc, mean = (t.cpu().float() for t in compiled(y))
+            # One fp16 rounding of the quotient: half an ulp is under 5e-4
+            # relative, so 2e-3 passes it and fails any wrong divisor, the
+            # nearest of which (rows +/- 64) is off by more than 12%.
+            torch.testing.assert_close(
+                mean, acc / rows, atol=0, rtol=2e-3, msg=f"at {rows} rows"
+            )
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+
 # #6496: shapes for a loop whose first reduction is over rows of Q and whose
 # body also has ops of other sizes (the K page), with Q built before the loop.
 FS_E, FS_KV, FS_QG, FS_D, FS_N, FS_PAGES = 4, 2, 4, 128, 128, 2

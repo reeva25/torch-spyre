@@ -92,6 +92,13 @@ class _SplitOpsHandler(WrapperHandler):
             return super().load(self._constant_map[key], sympy.Integer(0))
         return super().constant(fill_value, dtype)
 
+    def index_expr(self, expr, dtype):
+        key = ("index_expr", sympy.sympify(expr), dtype)
+        if key in self._constant_map:
+            # Load from the materialized 0-dim buffer, as constant() does.
+            return super().load(self._constant_map[key], sympy.Integer(0))
+        return super().index_expr(expr, dtype)
+
 
 class _IntermediateOpHandler(WrapperHandler):
     """Replace materialized compute ops with buffer loads.
@@ -482,6 +489,16 @@ def _lower_fx_node(node, gl, ops, before):
     return buf
 
 
+def _uses_loop_index(expr) -> bool:
+    """True if ``expr`` reads an index symbol _trace_inner_fn passed in.
+
+    Such a value differs per element (a ramp, a mask), so one scalar buffer
+    cannot stand in for it.
+    """
+    free = getattr(sympy.sympify(expr), "free_symbols", ())
+    return any(s.name.startswith(("_i", "_r")) for s in free)
+
+
 def _make_intermediate_bufs(
     intermediate_ops,
     vid_to_dtype,
@@ -524,7 +541,7 @@ def _make_intermediate_bufs(
         constant_map: Mapping from (fill_value, dtype) to materialized constant buffer name
         op_queues: Mapping from op_name to deque of materialized buffer names in trace order
     """
-    constant_map: dict[tuple[float, torch.dtype], str] = {}
+    constant_map: dict[tuple, str] = {}
     op_queues: dict[str, collections.deque] = {}
     for op_name, vid, inputs, kwargs in intermediate_ops:
         out_dtype = vid_to_dtype.get(vid, layout.dtype)
@@ -577,6 +594,42 @@ def _make_intermediate_bufs(
             vid_to_bufname[vid] = buf_name
             # Track this materialized constant for the handler's constant_map.
             constant_map[(fill_value, out_dtype)] = buf_name
+            continue
+
+        if op_name == "index_expr" and not _uses_loop_index(kwargs["_p0"]):
+            # A value computed from size symbols only, e.g. a declared row
+            # count s33. The wrapper evaluates it on the host on every call,
+            # so it is a per-run scalar, not a constant baked into the kernel.
+            expr = sympy.sympify(kwargs["_p0"])
+            out_dtype = kwargs.get("_p1", layout.dtype)
+            key = ("index_expr", expr, out_dtype)
+            if key in constant_map:
+                vid_to_bufname[vid] = constant_map[key]
+                continue
+            with gl.graph.inserting_before(orig_node):
+                new_node = gl.graph.create_node(
+                    "call_function",
+                    torch.ops.spyre.constant.default,
+                    (expr, out_dtype, layout.device),
+                    {},
+                )
+            _set_split_child_provenance(orig_node, new_node, new_node.target)
+            new_node.meta["val"] = torch.empty((), dtype=out_dtype, device="meta")
+            tb = gl.run_node(new_node)
+            gl.env[new_node] = tb  # run_node does not record it in the env
+            new_buf = tb.data.data
+            object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
+            decompose_provenance(
+                orig_buffer,
+                (new_buf,),
+                pass_name="split_multi_ops",
+                reason=f"materialize {op_name}",
+                inherit_origins=False,
+            )
+            move_before(operations, before, new_buf)
+            buf_name = new_buf.get_name()
+            vid_to_bufname[vid] = buf_name
+            constant_map[key] = buf_name
             continue
 
         def assert_fx_node(v):
